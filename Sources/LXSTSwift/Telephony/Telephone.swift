@@ -46,6 +46,20 @@ public actor Telephone {
     /// Remote peer's identity (after identification).
     private var remoteIdentity: Identity?
 
+    // MARK: - Audio Pipeline
+
+    /// Audio processing pipeline for encoding/decoding audio frames.
+    private var audioPipeline: AudioPipeline?
+
+    /// Link source for receiving remote audio frames.
+    private var linkSource: LinkSource?
+
+    /// Active codec for the current call.
+    private var codec: (any AudioCodec)?
+
+    /// Callback for delivering decoded PCM audio to the UI layer.
+    private var decodedAudioCallback: (@Sendable ([Float], Int, Int) async -> Void)?
+
     // MARK: - Configuration
 
     /// Caller filtering. Python Telephony.py:123-124
@@ -120,6 +134,35 @@ public actor Telephone {
 
     public func setEndedCallback(_ callback: @escaping @Sendable (Identity?, CallEndReason) async -> Void) {
         self.endedCallback = callback
+    }
+
+    /// Set callback for receiving decoded PCM audio frames from the remote peer.
+    ///
+    /// Called by CallManager to receive audio for playback. Parameters:
+    /// - samples: Float32 PCM samples (-1.0 to 1.0)
+    /// - sampleRate: Sample rate in Hz
+    /// - channels: Number of audio channels
+    public func setDecodedAudioCallback(
+        _ callback: @escaping @Sendable ([Float], Int, Int) async -> Void
+    ) {
+        self.decodedAudioCallback = callback
+    }
+
+    // MARK: - Audio Frame Send/Receive
+
+    /// Send captured audio samples to the remote peer.
+    ///
+    /// Encodes the samples with the active codec and sends over the link.
+    /// Called by CallManager with mic-captured PCM float samples.
+    ///
+    /// - Parameter samples: Float32 PCM samples from the microphone
+    public func sendAudioFrame(_ samples: [Float]) async {
+        guard callState == .established,
+              activeCall != nil,
+              let pipeline = audioPipeline,
+              let codec = codec else { return }
+
+        await pipeline.processCapture(samples, codec: codec)
     }
 
     // MARK: - Incoming Call Handling
@@ -202,7 +245,7 @@ public actor Telephone {
         transitionState(to: .connecting)
         await sendSignal(.connecting, on: link)
 
-        // Audio pipeline setup would go here (Phase 4)
+        await startAudioPipeline()
 
         transitionState(to: .established)
         await sendSignal(.established, on: link)
@@ -220,6 +263,7 @@ public actor Telephone {
         guard let link = activeCall else { return }
 
         cancelTimers()
+        await stopAudioPipeline()
 
         // If ringing and incoming, send REJECTED
         if isIncoming && callState == .ringing {
@@ -303,8 +347,10 @@ public actor Telephone {
                 await handleSignal(signal)
             }
         case .frame:
-            // Audio frame — Phase 4 will handle
-            break
+            // Route audio frame to pipeline via link source
+            if let source = linkSource {
+                await source.handlePacket(data: data, packet: packet)
+            }
         }
     }
 
@@ -362,7 +408,7 @@ public actor Telephone {
             logger.info("[TELEPHONE] Remote CONNECTING")
             transitionState(to: .connecting)
             cancelTimers()
-            // Audio pipeline setup (Phase 4)
+            await startAudioPipeline()
 
         case .established:
             // Call fully established
@@ -370,7 +416,6 @@ public actor Telephone {
                 logger.info("[TELEPHONE] Call ESTABLISHED (outgoing)")
                 transitionState(to: .established)
                 cancelTimers()
-                // Start audio pipelines (Phase 4)
                 if let remote = remoteIdentity {
                     await establishedCallback?(remote)
                 }
@@ -430,11 +475,91 @@ public actor Telephone {
         guard activeCall != nil else { return }
 
         cancelTimers()
+        await stopAudioPipeline()
         let remote = remoteIdentity
         let endReason: CallEndReason = (reason == .destinationClosed) ? .remoteHangup : .linkClosed
         resetCallState()
         transitionState(to: .ended(endReason))
         await endedCallback?(remote, endReason)
+    }
+
+    // MARK: - Audio Pipeline Management
+
+    /// Create and start the audio pipeline for the current call.
+    ///
+    /// Creates the codec from the active profile (tries Opus/Codec2 first,
+    /// falls back to NullCodec), sets up the AudioPipeline and LinkSource,
+    /// and wires callbacks for encoding/decoding audio.
+    private func startAudioPipeline() async {
+        let profile = activeProfile ?? .qualityMedium
+
+        // Create codec: try real codec first, fall back to NullCodec
+        let activeCodec: any AudioCodec
+        switch profile.codecType {
+        case .opus:
+            if let opusProfile = profile.opusProfile,
+               let opus = try? OpusCodec(profile: opusProfile) {
+                activeCodec = opus
+            } else {
+                activeCodec = NullCodec()
+            }
+        case .codec2:
+            if let c2Mode = profile.codec2Mode,
+               let c2 = try? Codec2Codec(mode: c2Mode) {
+                activeCodec = c2
+            } else {
+                activeCodec = NullCodec()
+            }
+        default:
+            activeCodec = NullCodec()
+        }
+        self.codec = activeCodec
+
+        // Create pipeline
+        let pipelineConfig = AudioPipeline.Config(profile: profile)
+        let pipeline = AudioPipeline(config: pipelineConfig)
+        self.audioPipeline = pipeline
+
+        // Create link source for receiving remote audio
+        let source = LinkSource()
+        self.linkSource = source
+
+        // Wire link source frame callback → pipeline decode → decoded samples callback
+        let codecRef = activeCodec
+        await source.setFrameCallback { [weak pipeline] codecType, audioData in
+            guard let pipeline = pipeline else { return }
+            await pipeline.processReceived(audioData, codec: codecRef)
+        }
+
+        // Wire pipeline encoded frame callback → pack → send over link
+        await pipeline.setEncodedFrameCallback { [weak self] codecType, encodedData in
+            guard let self = self else { return }
+            let packed = LXSTWireFormat.packFrame(codecType: codecType, encodedAudio: encodedData)
+            if let link = await self.activeCall {
+                await self.sendData(packed, on: link)
+            }
+        }
+
+        // Wire pipeline decoded samples callback → forward to UI
+        await pipeline.setDecodedSamplesCallback { [weak self] samples, rate, channels in
+            guard let self = self else { return }
+            await self.decodedAudioCallback?(samples, rate, channels)
+        }
+
+        // Start components
+        await pipeline.start()
+        await source.start()
+
+        logger.info("[TELEPHONE] Audio pipeline started: codec=\(String(describing: activeCodec.codecType)), profile=\(profile.displayName)")
+    }
+
+    /// Stop and tear down the audio pipeline.
+    private func stopAudioPipeline() async {
+        await audioPipeline?.stop()
+        await linkSource?.stop()
+        audioPipeline = nil
+        linkSource = nil
+        codec = nil
     }
 
     // MARK: - State Management
