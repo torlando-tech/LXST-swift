@@ -17,13 +17,53 @@ let package = Package(
         .package(path: "../ReticulumSwift"),
     ],
     targets: [
-        // C library shims (headers + linker settings)
+        // Opus codec compiled from source (v1.5.2)
         .target(
             name: "COpus",
             path: "Sources/COpus",
+            exclude: [
+                // Build system / meta files
+                "AUTHORS", "COPYING", "ChangeLog", "INSTALL", "NEWS", "README",
+                "CMakeLists.txt", "Makefile.am", "Makefile.in", "Makefile.unix", "Makefile.mips",
+                "configure", "configure.ac", "config.guess", "config.sub", "config.h.in",
+                "aclocal.m4", "compile", "depcomp", "install-sh", "ltmain.sh", "missing", "test-driver",
+                "meson.build", "meson_options.txt",
+                "opus.m4", "opus.pc.in", "opus-uninstalled.pc.in", "package_version",
+                "celt_headers.mk", "celt_sources.mk", "opus_headers.mk", "opus_sources.mk",
+                "silk_headers.mk", "silk_sources.mk", "lpcnet_headers.mk", "lpcnet_sources.mk",
+                // Directories to exclude
+                "cmake", "doc", "m4", "meson", "tests", "dnn",
+                // Platform-specific SIMD (not needed for generic float build)
+                "celt/arm", "celt/mips", "celt/x86",
+                "silk/arm", "silk/mips", "silk/x86",
+                "silk/fixed",  // Fixed-point — we use floating-point
+                "silk/float/x86",  // AVX2 intrinsics in float subdir
+                // Test/demo files in source dirs
+                "celt/tests", "silk/tests",
+                "celt/opus_custom_demo.c",
+                "src/opus_demo.c", "src/opus_compare.c", "src/repacketizer_demo.c",
+                // Sub-dir meson/build files
+                "celt/meson.build", "silk/meson.build",
+                "src/meson.build", "include/meson.build",
+            ],
             publicHeadersPath: "include",
-            linkerSettings: [
-                .linkedLibrary("opus"),
+            cSettings: [
+                .headerSearchPath("."),
+                .headerSearchPath("celt"),
+                .headerSearchPath("silk"),
+                .headerSearchPath("silk/float"),
+                .headerSearchPath("src"),
+                .define("OPUS_BUILD"),
+                .define("VAR_ARRAYS", to: "1"),
+                .define("FLOATING_POINT"),
+                .define("HAVE_LRINT", to: "1"),
+                .define("HAVE_LRINTF", to: "1"),
+                .define("HAVE_STDINT_H", to: "1"),
+                .define("HAVE_DLFCN_H", to: "1"),
+                .define("HAVE_INTTYPES_H", to: "1"),
+                .define("HAVE_MEMORY_H", to: "1"),
+                .define("HAVE_STDLIB_H", to: "1"),
+                .define("HAVE_STRING_H", to: "1"),
             ]
         ),
         .target(
@@ -38,7 +78,8 @@ let package = Package(
             name: "LXSTSwift",
             dependencies: [
                 "ReticulumSwift",
-                // COpus and CCodec2 are optional — Swift code uses #if canImport()
+                "COpus",
+                // CCodec2 is optional — Swift code uses #if canImport()
             ],
             path: "Sources/LXSTSwift"
         ),

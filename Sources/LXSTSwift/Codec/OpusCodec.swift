@@ -53,10 +53,10 @@ public final class OpusCodec: AudioCodec, @unchecked Sendable {
         }
 
         // Set bitrate ceiling
-        opus_encoder_ctl(encoder!, OPUS_SET_BITRATE_REQUEST, Int32(profile.bitrateCeiling))
+        opus_encoder_set_bitrate(encoder!, Int32(profile.bitrateCeiling))
 
         // Set complexity (10 = highest quality)
-        opus_encoder_ctl(encoder!, OPUS_SET_COMPLEXITY_REQUEST, Int32(10))
+        opus_encoder_set_complexity(encoder!, Int32(10))
 
         decoder = opus_decoder_create(Int32(profile.sampleRate), Int32(channels), &error)
         guard error == OPUS_OK, decoder != nil else {
@@ -89,7 +89,7 @@ public final class OpusCodec: AudioCodec, @unchecked Sendable {
 
         var outputBuffer = [UInt8](repeating: 0, count: outputBufferSize)
         let encodedLength = samples.withUnsafeBufferPointer { pcmPtr in
-            opus_encode(enc, pcmPtr.baseAddress, Int32(frameSize),
+            opus_encode(enc, pcmPtr.baseAddress!, Int32(frameSize),
                        &outputBuffer, Int32(outputBufferSize))
         }
 

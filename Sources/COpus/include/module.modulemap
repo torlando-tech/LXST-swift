@@ -1,5 +1,9 @@
-module COpus [system] {
+module COpus {
     header "opus.h"
-    link "opus"
+    header "opus_defines.h"
+    header "opus_types.h"
+    header "opus_multistream.h"
+    header "opus_projection.h"
+    header "opus_swift_helpers.h"
     export *
 }
