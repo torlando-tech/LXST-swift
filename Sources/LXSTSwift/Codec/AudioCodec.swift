@@ -32,4 +32,17 @@ public protocol AudioCodec: Sendable {
     /// - Parameter data: Encoded audio data (without codec header byte)
     /// - Returns: Array of Int16 PCM samples
     func decode(_ data: Data) throws -> [Int16]
+
+    /// Generate packet loss concealment (PLC) samples.
+    ///
+    /// Synthesizes audio to fill gaps when packets are lost or late.
+    /// Codecs with built-in PLC (e.g. Opus) should override this.
+    ///
+    /// - Parameter frameSize: Number of samples per channel to generate
+    /// - Returns: Int16 PCM samples, or nil if PLC is not supported
+    func decodePLC(frameSize: Int) -> [Int16]?
+}
+
+extension AudioCodec {
+    public func decodePLC(frameSize: Int) -> [Int16]? { nil }
 }

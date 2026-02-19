@@ -406,6 +406,130 @@ final class MixerTests: XCTestCase {
     }
 }
 
+final class JitterBufferTests: XCTestCase {
+
+    func testEnqueueDequeue() async {
+        let buffer = JitterBuffer(targetDepth: 2, maxDepth: 8)
+        let frames: [[Float]] = (0..<5).map { [Float($0)] }
+        for frame in frames {
+            await buffer.enqueue(frame)
+        }
+        for i in 0..<5 {
+            let frame = await buffer.dequeue()
+            XCTAssertEqual(frame, [Float(i)])
+        }
+    }
+
+    func testPrimingDelaysOutput() async {
+        let buffer = JitterBuffer(targetDepth: 3, maxDepth: 8)
+        await buffer.enqueue([1.0])
+        await buffer.enqueue([2.0])
+        // Only 2 frames enqueued, target is 3 — should not release yet
+        let result = await buffer.dequeue()
+        XCTAssertNil(result)
+    }
+
+    func testPrimingReleasesAfterTarget() async {
+        let buffer = JitterBuffer(targetDepth: 3, maxDepth: 8)
+        await buffer.enqueue([1.0])
+        await buffer.enqueue([2.0])
+        await buffer.enqueue([3.0])
+        // Now primed — dequeue should succeed
+        let result = await buffer.dequeue()
+        XCTAssertEqual(result, [1.0])
+    }
+
+    func testOverflowDropsOldest() async {
+        let buffer = JitterBuffer(targetDepth: 1, maxDepth: 3)
+        await buffer.enqueue([1.0])
+        await buffer.enqueue([2.0])
+        await buffer.enqueue([3.0])
+        await buffer.enqueue([4.0]) // overflow — drops [1.0]
+
+        let stats = await buffer.stats
+        XCTAssertEqual(stats.totalOverflows, 1)
+        XCTAssertEqual(stats.depth, 3)
+
+        let first = await buffer.dequeue()
+        XCTAssertEqual(first, [2.0])
+    }
+
+    func testUnderrunTracking() async {
+        let buffer = JitterBuffer(targetDepth: 1, maxDepth: 8)
+        await buffer.enqueue([1.0])
+        // Primed with 1 frame, dequeue it
+        _ = await buffer.dequeue()
+        // Now empty — dequeue should be underrun
+        let result = await buffer.dequeue()
+        XCTAssertNil(result)
+        let stats = await buffer.stats
+        XCTAssertEqual(stats.totalUnderruns, 1)
+    }
+
+    func testResetClearsState() async {
+        let buffer = JitterBuffer(targetDepth: 2, maxDepth: 8)
+        await buffer.enqueue([1.0])
+        await buffer.enqueue([2.0])
+        await buffer.enqueue([3.0])
+        _ = await buffer.dequeue()
+
+        await buffer.reset()
+
+        let stats = await buffer.stats
+        XCTAssertEqual(stats.depth, 0)
+        XCTAssertFalse(stats.isPrimed)
+        XCTAssertEqual(stats.totalEnqueued, 0)
+        XCTAssertEqual(stats.totalDequeued, 0)
+        XCTAssertEqual(stats.totalUnderruns, 0)
+        XCTAssertEqual(stats.totalOverflows, 0)
+    }
+}
+
+#if canImport(COpus)
+import COpus
+
+final class OpusPLCTests: XCTestCase {
+
+    func testOpusPLCProducesSamples() throws {
+        let profile = OpusProfile.voiceMedium
+        let codec = try OpusCodec(profile: profile)
+        let frameSize = profile.sampleRate * 20 / 1000 // 20ms frame
+
+        // Seed decoder state by decoding a real frame
+        var samples = [Int16](repeating: 0, count: frameSize)
+        for i in 0..<frameSize {
+            samples[i] = Int16(clamping: Int(sin(Double(i) * 2.0 * .pi * 440.0 / Double(profile.sampleRate)) * 16000))
+        }
+        let encoded = try codec.encode(samples)
+        _ = try codec.decode(encoded)
+
+        // Now generate PLC
+        let plc = codec.decodePLC(frameSize: frameSize)
+        XCTAssertNotNil(plc)
+        XCTAssertEqual(plc!.count, frameSize * profile.channels)
+    }
+
+    func testOpusPLCOutputNotAllZeros() throws {
+        let profile = OpusProfile.voiceMedium
+        let codec = try OpusCodec(profile: profile)
+        let frameSize = profile.sampleRate * 20 / 1000
+
+        // Seed with a loud tone
+        var samples = [Int16](repeating: 0, count: frameSize)
+        for i in 0..<frameSize {
+            samples[i] = Int16(clamping: Int(sin(Double(i) * 2.0 * .pi * 440.0 / Double(profile.sampleRate)) * 30000))
+        }
+        let encoded = try codec.encode(samples)
+        _ = try codec.decode(encoded)
+
+        let plc = codec.decodePLC(frameSize: frameSize)
+        XCTAssertNotNil(plc)
+        let hasNonZero = plc!.contains { $0 != 0 }
+        XCTAssertTrue(hasNonZero, "PLC output should have non-zero samples (interpolation, not silence)")
+    }
+}
+#endif
+
 final class AudioPipelineTests: XCTestCase {
 
     func testConfigFromProfile() {

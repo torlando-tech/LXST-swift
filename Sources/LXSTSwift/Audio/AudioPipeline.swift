@@ -68,6 +68,15 @@ public actor AudioPipeline {
     /// Callback that receives decoded float samples ready for playback.
     private var decodedSamplesCallback: (@Sendable ([Float], Int, Int) async -> Void)?
 
+    /// Jitter buffer for smoothing receive-side timing jitter.
+    private var jitterBuffer: JitterBuffer?
+
+    /// Periodic playout task that dequeues from the jitter buffer.
+    private var playoutTask: Task<Void, Never>?
+
+    /// Active codec reference for PLC generation during underruns.
+    private var activeCodec: (any AudioCodec)?
+
     public init(config: Config) {
         self.config = config
     }
@@ -87,6 +96,19 @@ public actor AudioPipeline {
         self.decodedSamplesCallback = callback
     }
 
+    /// Start the pipeline with a codec for PLC and jitter buffering.
+    ///
+    /// - Parameter codec: The active audio codec (used for PLC on underrun)
+    public func start(codec: any AudioCodec) {
+        isRunning = true
+        self.activeCodec = codec
+        let target = playoutTargetDepth
+        self.jitterBuffer = JitterBuffer(targetDepth: target, maxDepth: target * 3)
+        startPlayoutLoop()
+        logger.info("[PIPELINE] Started with codec at \(self.config.sampleRate)Hz, jitter target=\(target)")
+    }
+
+    /// Start the pipeline without jitter buffering (legacy path).
     public func start() {
         isRunning = true
         logger.info("[PIPELINE] Started with codec at \(self.config.sampleRate)Hz")
@@ -94,7 +116,21 @@ public actor AudioPipeline {
 
     public func stop() {
         isRunning = false
+        playoutTask?.cancel()
+        playoutTask = nil
+        activeCodec = nil
+        jitterBuffer = nil
         logger.info("[PIPELINE] Stopped")
+    }
+
+    /// Computed target depth based on frame time.
+    private var playoutTargetDepth: Int {
+        switch config.frameTimeMs {
+        case ...10: return 4   // 40ms total
+        case ...20: return 3   // 60ms total
+        case ...60: return 3   // 180ms total
+        default:    return 2   // high-latency profiles
+        }
     }
 
     /// Process captured float samples through the encode pipeline.
@@ -114,17 +150,54 @@ public actor AudioPipeline {
 
     /// Process received encoded data through the decode pipeline.
     ///
-    /// Encoded data → codec.decode() → Int16 → Float → decoded samples callback
+    /// When a jitter buffer is active, decoded frames are enqueued for playout.
+    /// Otherwise, frames are delivered directly to the callback (legacy path).
     public func processReceived(_ data: Data, codec: any AudioCodec) async {
         guard isRunning else { return }
 
         do {
             let int16Samples = try codec.decode(data)
             let floatSamples = int16ToFloat(int16Samples)
-            await decodedSamplesCallback?(floatSamples, config.sampleRate, config.channels)
+
+            if let jitterBuffer {
+                await jitterBuffer.enqueue(floatSamples)
+            } else {
+                await decodedSamplesCallback?(floatSamples, config.sampleRate, config.channels)
+            }
         } catch {
             logger.error("[PIPELINE] Decode error: \(error)")
         }
+    }
+
+    // MARK: - Playout Loop
+
+    /// Start the periodic playout loop that dequeues from the jitter buffer.
+    private func startPlayoutLoop() {
+        let intervalNs = UInt64(config.frameTimeMs) * 1_000_000
+        playoutTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                if let samples = await self.jitterBuffer?.dequeue() {
+                    await self.decodedSamplesCallback?(
+                        samples, self.config.sampleRate, self.config.channels)
+                } else if await (self.jitterBuffer?.isPrimed ?? false) {
+                    let plc = await self.generatePLC()
+                    await self.decodedSamplesCallback?(
+                        plc, self.config.sampleRate, self.config.channels)
+                }
+                try? await Task.sleep(nanoseconds: intervalNs)
+            }
+        }
+    }
+
+    /// Generate PLC samples from the active codec, or silence as fallback.
+    private func generatePLC() -> [Float] {
+        let frameSize = config.samplesPerFrame
+        if let codec = activeCodec,
+           let plc = codec.decodePLC(frameSize: frameSize) {
+            return int16ToFloat(plc)
+        }
+        return [Float](repeating: 0, count: frameSize * config.channels)
     }
 }
 

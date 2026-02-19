@@ -547,7 +547,7 @@ public actor Telephone {
         }
 
         // Start components
-        await pipeline.start()
+        await pipeline.start(codec: activeCodec)
         await source.start()
 
         logger.info("[TELEPHONE] Audio pipeline started: codec=\(String(describing: activeCodec.codecType)), profile=\(profile.displayName)")

@@ -31,6 +31,9 @@ public final class Codec2Codec: AudioCodec, @unchecked Sendable {
     private let samplesPerFrame: Int
     private let bytesPerFrame: Int
 
+    /// Last decoded frame for PLC (frame repetition).
+    private var lastDecodedFrame: [Int16]?
+
     /// Mode header byte for wire format (prepended to encoded data).
     public var modeHeader: UInt8 { currentMode.rawValue }
 
@@ -163,7 +166,19 @@ public final class Codec2Codec: AudioCodec, @unchecked Sendable {
             decoded.replaceSubrange(destStart..<(destStart + currentSPF), with: outputBuffer)
         }
 
+        lastDecodedFrame = decoded
         return decoded
+    }
+
+    /// Generate PLC samples by repeating the last decoded frame.
+    ///
+    /// Codec2 has no built-in PLC, so frame repetition is used — a standard
+    /// concealment technique for vocoders that sounds much better than silence.
+    ///
+    /// - Parameter frameSize: Expected samples (ignored; returns last frame size)
+    /// - Returns: Last decoded frame, or nil if no frame has been decoded yet
+    public func decodePLC(frameSize: Int) -> [Int16]? {
+        lastDecodedFrame
     }
 
     /// Map Codec2Mode enum to libcodec2 C mode constant.
@@ -202,6 +217,8 @@ public final class Codec2Codec: AudioCodec, @unchecked Sendable {
     public func decode(_ data: Data) throws -> [Int16] {
         throw LXSTError.codecError("Codec2 codec not available")
     }
+
+    public func decodePLC(frameSize: Int) -> [Int16]? { nil }
 }
 
 #endif

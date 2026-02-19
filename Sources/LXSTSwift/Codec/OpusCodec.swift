@@ -123,6 +123,21 @@ public final class OpusCodec: AudioCodec, @unchecked Sendable {
 
         return Array(pcmBuffer.prefix(Int(decodedSamples) * channels))
     }
+
+    /// Generate PLC samples using Opus's built-in packet loss concealment.
+    ///
+    /// Calls `opus_decode(nil)` which synthesizes audio based on the decoder's
+    /// internal state from previous frames.
+    ///
+    /// - Parameter frameSize: Number of samples per channel to generate
+    /// - Returns: Synthesized Int16 PCM samples, or nil on failure
+    public func decodePLC(frameSize: Int) -> [Int16]? {
+        guard let dec = decoder else { return nil }
+        var pcmBuffer = [Int16](repeating: 0, count: frameSize * channels)
+        let result = opus_decode(dec, nil, 0, &pcmBuffer, Int32(frameSize), 0)
+        guard result > 0 else { return nil }
+        return Array(pcmBuffer.prefix(Int(result) * channels))
+    }
 }
 
 #else
@@ -150,6 +165,8 @@ public final class OpusCodec: AudioCodec, @unchecked Sendable {
     public func decode(_ data: Data) throws -> [Int16] {
         throw LXSTError.codecError("Opus codec not available")
     }
+
+    public func decodePLC(frameSize: Int) -> [Int16]? { nil }
 }
 
 #endif
