@@ -1,0 +1,543 @@
+//
+//  Telephone.swift
+//  LXSTSwift
+//
+//  Main telephony actor matching Python LXST Primitives/Telephony.py.
+//  Manages call signaling over Reticulum Links.
+//
+
+import Foundation
+import os.log
+
+private let logger = Logger(subsystem: "com.lxst.swift", category: "Telephone")
+
+/// Telephony actor for LXST voice calls over Reticulum links.
+///
+/// Manages the full call lifecycle: destination registration, incoming/outgoing
+/// call setup, signal exchange, and teardown. Audio pipelines are stubbed —
+/// this actor handles only signaling.
+///
+/// Matches Python `Telephone` class in `Primitives/Telephony.py`.
+public actor Telephone {
+
+    // MARK: - Properties
+
+    /// Local identity for this telephone endpoint.
+    public let identity: Identity
+
+    /// Transport instance for sending/receiving packets.
+    private let transport: ReticuLumTransport
+
+    /// RNS destination for incoming calls: (identity, IN, SINGLE, "lxst", "telephony").
+    public let destination: Destination
+
+    /// Current call state.
+    public private(set) var callState: CallState = .idle
+
+    /// Active call link (nil when idle).
+    private var activeCall: Link?
+
+    /// Whether this is an incoming or outgoing call.
+    private var isIncoming: Bool = false
+
+    /// Active telephony profile for the current call.
+    private var activeProfile: TelephonyProfile?
+
+    /// Remote peer's identity (after identification).
+    private var remoteIdentity: Identity?
+
+    // MARK: - Configuration
+
+    /// Caller filtering. Python Telephony.py:123-124
+    public var allowed: CallerFilter = .allowAll
+
+    /// Ring timeout duration. Python Telephony.py:115
+    public var ringTime: TimeInterval = TelephonyConstants.ringTime
+
+    /// Outgoing call wait timeout. Python Telephony.py:116
+    public var waitTime: TimeInterval = TelephonyConstants.waitTime
+
+    /// Connect timeout. Python Telephony.py:117
+    public var connectTimeout: TimeInterval = TelephonyConstants.connectTime
+
+    // MARK: - Callbacks
+
+    /// Called when an incoming call starts ringing.
+    private var ringingCallback: (@Sendable (Identity) async -> Void)?
+
+    /// Called when a call is established.
+    private var establishedCallback: (@Sendable (Identity) async -> Void)?
+
+    /// Called when a call ends.
+    private var endedCallback: (@Sendable (Identity?, CallEndReason) async -> Void)?
+
+    // MARK: - Timers
+
+    /// Ring timeout task.
+    private var ringTimeoutTask: Task<Void, Never>?
+
+    /// Connect timeout task.
+    private var connectTimeoutTask: Task<Void, Never>?
+
+    // MARK: - Initialization
+
+    /// Create a new Telephone endpoint.
+    ///
+    /// Registers an RNS destination `(identity, IN, SINGLE, "lxst", "telephony")`
+    /// for incoming calls and sets up the link established callback.
+    ///
+    /// - Parameters:
+    ///   - identity: Local identity for this endpoint
+    ///   - transport: Transport for sending/receiving
+    public init(identity: Identity, transport: ReticuLumTransport) async {
+        self.identity = identity
+        self.transport = transport
+
+        // Create destination matching Python: Destination(identity, IN, SINGLE, APP_NAME, PRIMITIVE_NAME)
+        self.destination = Destination(
+            identity: identity,
+            appName: TelephonyConstants.appName,
+            aspects: [TelephonyConstants.primitiveName],
+            type: .single,
+            direction: .in
+        )
+
+        // Register destination with transport for incoming links
+        await transport.registerDestination(destination)
+
+        logger.info("[TELEPHONE] Listening on \(self.destination.hash.prefix(8).map { String(format: "%02x", $0) }.joined())")
+    }
+
+    // MARK: - Callback Setters
+
+    public func setRingingCallback(_ callback: @escaping @Sendable (Identity) async -> Void) {
+        self.ringingCallback = callback
+    }
+
+    public func setEstablishedCallback(_ callback: @escaping @Sendable (Identity) async -> Void) {
+        self.establishedCallback = callback
+    }
+
+    public func setEndedCallback(_ callback: @escaping @Sendable (Identity?, CallEndReason) async -> Void) {
+        self.endedCallback = callback
+    }
+
+    // MARK: - Incoming Call Handling
+
+    /// Handle an incoming link established event.
+    ///
+    /// Python `__incoming_link_established`: If busy, send BUSY and teardown.
+    /// Otherwise, send AVAILABLE and wait for identification.
+    ///
+    /// - Parameter link: The newly established incoming link
+    public func handleIncomingLink(_ link: Link) async {
+        // Check if already in a call
+        if activeCall != nil || callState != .idle {
+            logger.info("[TELEPHONE] Incoming call, but line busy — signalling BUSY")
+            await sendSignal(.busy, on: link)
+            await link.close()
+            return
+        }
+
+        isIncoming = true
+
+        // Set packet callback for signalling
+        await link.setPacketCallback { [weak self] data, packet in
+            await self?.handlePacket(data: data, packet: packet)
+        }
+
+        // Set identify callback to receive caller identity
+        await link.setIdentifyCallbacks(TelephoneIdentifyHandler(telephone: self))
+
+        // Store link and send AVAILABLE
+        activeCall = link
+        transitionState(to: .available)
+        await sendSignal(.available, on: link)
+        logger.info("[TELEPHONE] Sent AVAILABLE to incoming link")
+    }
+
+    /// Handle caller identification (LINKIDENTIFY received).
+    ///
+    /// Python `__caller_identified`: Check if allowed, send RINGING, start timer.
+    ///
+    /// - Parameters:
+    ///   - link: The link that identified
+    ///   - identity: The caller's verified identity
+    func handleCallerIdentified(_ remoteId: Identity) async {
+        guard let link = activeCall else { return }
+
+        // Check if caller is allowed
+        if !isAllowed(remoteId) {
+            logger.info("[TELEPHONE] Caller \(remoteId.hash.prefix(4).map { String(format: "%02x", $0) }.joined()) not allowed, BUSY")
+            await sendSignal(.busy, on: link)
+            await link.close()
+            resetCallState()
+            return
+        }
+
+        remoteIdentity = remoteId
+        transitionState(to: .ringing)
+        await sendSignal(.ringing, on: link)
+        logger.info("[TELEPHONE] Sent RINGING")
+
+        // Notify callback
+        await ringingCallback?(remoteId)
+
+        // Start ring timeout
+        startRingTimeout()
+    }
+
+    // MARK: - Answer / Hangup
+
+    /// Answer an incoming ringing call.
+    ///
+    /// Python `answer()`: send CONNECTING, open pipelines, send ESTABLISHED.
+    public func answer() async {
+        guard callState == .ringing, let link = activeCall, isIncoming else {
+            logger.warning("[TELEPHONE] Cannot answer: state=\(String(describing: self.callState))")
+            return
+        }
+
+        cancelTimers()
+        transitionState(to: .connecting)
+        await sendSignal(.connecting, on: link)
+
+        // Audio pipeline setup would go here (Phase 4)
+
+        transitionState(to: .established)
+        await sendSignal(.established, on: link)
+        logger.info("[TELEPHONE] Call ESTABLISHED (incoming)")
+
+        if let remote = remoteIdentity {
+            await establishedCallback?(remote)
+        }
+    }
+
+    /// Hang up the active call.
+    ///
+    /// Python `hangup()`: If ringing and incoming, send REJECTED. Teardown link.
+    public func hangup() async {
+        guard let link = activeCall else { return }
+
+        cancelTimers()
+
+        // If ringing and incoming, send REJECTED
+        if isIncoming && callState == .ringing {
+            await sendSignal(.rejected, on: link)
+        }
+
+        let linkState = await link.state
+        if linkState.isEstablished {
+            await link.close()
+        }
+
+        let reason: CallEndReason = .localHangup
+        let remote = remoteIdentity
+        resetCallState()
+        transitionState(to: .ended(reason))
+        await endedCallback?(remote, reason)
+    }
+
+    // MARK: - Outgoing Call
+
+    /// Initiate an outgoing call.
+    ///
+    /// Python `call()`: Create link, wait for AVAILABLE, identify, negotiate.
+    ///
+    /// - Parameters:
+    ///   - remoteIdentity: Identity of the person to call
+    ///   - profile: Preferred telephony profile (default: QUALITY_MEDIUM)
+    public func call(remoteIdentity: Identity, profile: TelephonyProfile = .qualityMedium) async throws {
+        guard callState == .idle, activeCall == nil else {
+            throw LXSTError.alreadyInCall
+        }
+
+        isIncoming = false
+        activeProfile = profile
+        transitionState(to: .calling)
+
+        // Create outbound destination
+        let callDest = Destination(
+            identity: remoteIdentity,
+            appName: TelephonyConstants.appName,
+            aspects: [TelephonyConstants.primitiveName],
+            type: .single,
+            direction: .out
+        )
+
+        // Create link
+        let link = Link(destination: callDest, identity: identity)
+        activeCall = link
+
+        // Set packet callback for signalling
+        await link.setPacketCallback { [weak self] data, packet in
+            await self?.handlePacket(data: data, packet: packet)
+        }
+
+        // Register link with transport and send request
+        let requestPacket = try await link.getLinkRequestPacket()
+        await link.markRequestSent()
+        try await transport.send(packet: requestPacket)
+
+        // Start connect timeout
+        startConnectTimeout()
+
+        logger.info("[TELEPHONE] Outgoing call initiated")
+    }
+
+    // MARK: - Signal Handling
+
+    /// Handle received packet data on the active call link.
+    ///
+    /// Python `signalling_received()`: Dispatch signals.
+    private func handlePacket(data: Data, packet: Packet) async {
+        guard let parsed = try? LXSTWireFormat.unpack(data) else { return }
+
+        switch parsed {
+        case .signals(let signals):
+            for signal in signals {
+                await handleSignal(signal)
+            }
+        case .mixed(let signals, _, _):
+            for signal in signals {
+                await handleSignal(signal)
+            }
+        case .frame:
+            // Audio frame — Phase 4 will handle
+            break
+        }
+    }
+
+    /// Handle a single signal value.
+    ///
+    /// Python `signalling_received()` lines 683-729.
+    private func handleSignal(_ signal: UInt) async {
+        guard let link = activeCall else { return }
+
+        // Check for preferred profile signal (>= 0xFF)
+        if let profile = LXSTWireFormat.extractPreferredProfile(from: signal) {
+            activeProfile = profile
+            logger.info("[TELEPHONE] Remote preferred profile: \(profile.displayName)")
+            return
+        }
+
+        guard let signalCode = LXSTWireFormat.extractSignal(from: signal) else { return }
+
+        switch signalCode {
+        case .busy:
+            logger.info("[TELEPHONE] Remote is BUSY")
+            cancelTimers()
+            let remote = remoteIdentity
+            await link.close()
+            resetCallState()
+            transitionState(to: .ended(.busy))
+            await endedCallback?(remote, .busy)
+
+        case .rejected:
+            logger.info("[TELEPHONE] Remote REJECTED call")
+            cancelTimers()
+            let remote = remoteIdentity
+            await link.close()
+            resetCallState()
+            transitionState(to: .ended(.rejected))
+            await endedCallback?(remote, .rejected)
+
+        case .available:
+            // Callee is available — send identification
+            logger.info("[TELEPHONE] Remote AVAILABLE, identifying...")
+            transitionState(to: .available)
+            try? await link.identify(identity: identity)
+
+        case .ringing:
+            // Callee is ringing — send preferred profile
+            logger.info("[TELEPHONE] Remote is RINGING")
+            transitionState(to: .ringing)
+            if let profile = activeProfile {
+                await sendPreferredProfile(profile, on: link)
+            }
+            await ringingCallback?(identity)
+
+        case .connecting:
+            // Callee answered, setting up pipelines
+            logger.info("[TELEPHONE] Remote CONNECTING")
+            transitionState(to: .connecting)
+            cancelTimers()
+            // Audio pipeline setup (Phase 4)
+
+        case .established:
+            // Call fully established
+            if !isIncoming {
+                logger.info("[TELEPHONE] Call ESTABLISHED (outgoing)")
+                transitionState(to: .established)
+                cancelTimers()
+                // Start audio pipelines (Phase 4)
+                if let remote = remoteIdentity {
+                    await establishedCallback?(remote)
+                }
+            }
+
+        case .calling:
+            break
+        }
+    }
+
+    // MARK: - Signal Sending
+
+    /// Send a signal over a link.
+    private func sendSignal(_ signal: LXSTSignal, on link: Link) async {
+        let data = LXSTWireFormat.packSignal(signal)
+        await sendData(data, on: link)
+    }
+
+    /// Send a preferred profile signal.
+    private func sendPreferredProfile(_ profile: TelephonyProfile, on link: Link) async {
+        let data = LXSTWireFormat.packPreferredProfile(profile)
+        await sendData(data, on: link)
+    }
+
+    /// Send raw data as a link DATA packet (context 0x00).
+    ///
+    /// Python: `RNS.Packet(link, data).send()`
+    /// This creates an encrypted link DATA packet and sends it.
+    private func sendData(_ data: Data, on link: Link) async {
+        do {
+            let encrypted = try await link.encrypt(data)
+            let header = PacketHeader(
+                headerType: .header1,
+                hasContext: true,
+                transportType: .broadcast,
+                destinationType: .link,
+                packetType: .data,
+                hopCount: 0
+            )
+            let linkId = await link.linkId
+            let packet = Packet(
+                header: header,
+                destination: linkId,
+                context: 0x00, // Regular DATA
+                data: encrypted
+            )
+            try await transport.send(packet: packet)
+        } catch {
+            logger.error("[TELEPHONE] Failed to send data: \(error)")
+        }
+    }
+
+    // MARK: - Link Closed Handler
+
+    /// Handle link closure (remote hangup or network failure).
+    func handleLinkClosed(reason: TeardownReason) async {
+        guard activeCall != nil else { return }
+
+        cancelTimers()
+        let remote = remoteIdentity
+        let endReason: CallEndReason = (reason == .destinationClosed) ? .remoteHangup : .linkClosed
+        resetCallState()
+        transitionState(to: .ended(endReason))
+        await endedCallback?(remote, endReason)
+    }
+
+    // MARK: - State Management
+
+    private func transitionState(to newState: CallState) {
+        callState = newState
+    }
+
+    private func resetCallState() {
+        activeCall = nil
+        remoteIdentity = nil
+        isIncoming = false
+        activeProfile = nil
+    }
+
+    // MARK: - Caller Filtering
+
+    private func isAllowed(_ remoteId: Identity) -> Bool {
+        switch allowed {
+        case .allowAll:
+            return true
+        case .allowNone:
+            return false
+        case .allowList(let hashes):
+            return hashes.contains(remoteId.hash)
+        }
+    }
+
+    // MARK: - Timers
+
+    private func startRingTimeout() {
+        ringTimeoutTask?.cancel()
+        ringTimeoutTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(self?.ringTime ?? 60))
+            guard !Task.isCancelled else { return }
+            await self?.handleRingTimeout()
+        }
+    }
+
+    private func startConnectTimeout() {
+        connectTimeoutTask?.cancel()
+        connectTimeoutTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(self?.waitTime ?? 70))
+            guard !Task.isCancelled else { return }
+            await self?.handleConnectTimeout()
+        }
+    }
+
+    private func cancelTimers() {
+        ringTimeoutTask?.cancel()
+        ringTimeoutTask = nil
+        connectTimeoutTask?.cancel()
+        connectTimeoutTask = nil
+    }
+
+    private func handleRingTimeout() async {
+        guard callState == .ringing else { return }
+        logger.info("[TELEPHONE] Ring timeout")
+        let remote = remoteIdentity
+        if let link = activeCall {
+            await link.close()
+        }
+        resetCallState()
+        transitionState(to: .ended(.ringTimeout))
+        await endedCallback?(remote, .ringTimeout)
+    }
+
+    private func handleConnectTimeout() async {
+        guard callState == .calling || callState == .available else { return }
+        logger.info("[TELEPHONE] Connect timeout")
+        let remote = remoteIdentity
+        if let link = activeCall {
+            await link.close()
+        }
+        resetCallState()
+        transitionState(to: .ended(.connectTimeout))
+        await endedCallback?(remote, .connectTimeout)
+    }
+}
+
+// MARK: - Caller Filter
+
+/// Caller filtering configuration.
+public enum CallerFilter: Sendable {
+    /// Allow all callers. Python Telephony.py:123
+    case allowAll
+    /// Allow no callers. Python Telephony.py:124
+    case allowNone
+    /// Allow only specific identity hashes.
+    case allowList([Data])
+}
+
+// MARK: - Identity Callback Handler
+
+/// Bridge between Link's IdentifyCallbacks and Telephone actor.
+final class TelephoneIdentifyHandler: IdentifyCallbacks, @unchecked Sendable {
+    private weak var telephone: Telephone?
+
+    init(telephone: Telephone) {
+        self.telephone = telephone
+    }
+
+    func remoteIdentified(_ identity: Identity) async {
+        await telephone?.handleCallerIdentified(identity)
+    }
+}
