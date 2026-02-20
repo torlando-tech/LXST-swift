@@ -66,12 +66,25 @@ let package = Package(
                 .define("HAVE_STRING_H", to: "1"),
             ]
         ),
+        // Codec2 voice codec compiled from source (v1.2.0)
         .target(
             name: "CCodec2",
             path: "Sources/CCodec2",
             publicHeadersPath: "include",
+            cSettings: [
+                .headerSearchPath("."),
+                .headerSearchPath("include"),
+                .define("CODEC2_VERSION_MAJOR", to: "1"),
+                .define("CODEC2_VERSION_MINOR", to: "2"),
+                .define("CODEC2_VERSION_PATCH", to: "0"),
+                .define("CODEC2_VERSION", to: "\"1.2.0\""),
+                .define("GIT_HASH", to: "\"None\""),
+                .define("HAVE_STDLIB_H", to: "1"),
+                .define("HAVE_STRING_H", to: "1"),
+                .define("SIZEOF_INT", to: "4"),
+            ],
             linkerSettings: [
-                .linkedLibrary("codec2"),
+                .linkedLibrary("m", .when(platforms: [.linux])),
             ]
         ),
         .target(
@@ -79,7 +92,7 @@ let package = Package(
             dependencies: [
                 "ReticulumSwift",
                 "COpus",
-                // CCodec2 is optional — Swift code uses #if canImport()
+                "CCodec2",
             ],
             path: "Sources/LXSTSwift"
         ),
