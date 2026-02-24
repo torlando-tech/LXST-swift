@@ -54,35 +54,68 @@ public actor LinkSource {
     /// Python `_packet()` (Network.py:109): Unpacks msgpack, routes frames
     /// and signals. Detects codec changes from header byte.
     ///
+    /// Parses the msgpack map directly to support both single-frame and
+    /// Android batch formats `{0x01: [f1, f2, f3]}` where each element
+    /// is bytes(codec_type + opus_data).
+    ///
     /// - Parameters:
     ///   - data: Decrypted packet data
     ///   - packet: The original packet
     public func handlePacket(data: Data, packet: Packet) async {
         guard isRunning else { return }
 
-        guard let parsed = try? LXSTWireFormat.unpack(data) else { return }
+        guard let value = try? unpackMsgPack(data),
+              case .map(let dict) = value else { return }
 
-        switch parsed {
-        case .frame(let codecHeader, let audioData):
-            if let codecType = LXSTCodecType(rawValue: codecHeader) {
-                if codecType != currentCodecType {
-                    currentCodecType = codecType
+        // Handle signals (dual-key lookup: Python/Android encode small int keys as fixint → .int)
+        let sigValue = dict[MessagePackValue.uint(UInt64(LXSTField.signalling))]
+            ?? dict[MessagePackValue.int(Int64(LXSTField.signalling))]
+        if let sigValue = sigValue {
+            var signals: [UInt] = []
+            switch sigValue {
+            case .array(let arr):
+                signals = arr.compactMap { elem -> UInt? in
+                    if case .uint(let v) = elem { return UInt(v) }
+                    if case .int(let v) = elem, v >= 0 { return UInt(v) }
+                    return nil
                 }
-                await frameCallback?(codecType, audioData)
+            case .uint(let v): signals = [UInt(v)]
+            case .int(let v) where v >= 0: signals = [UInt(v)]
+            default: break
             }
-
-        case .signals(let signals):
-            await signalCallback?(signals)
-
-        case .mixed(let signals, let codecHeader, let audioData):
-            // Handle both
-            await signalCallback?(signals)
-            if let codecType = LXSTCodecType(rawValue: codecHeader) {
-                if codecType != currentCodecType {
-                    currentCodecType = codecType
-                }
-                await frameCallback?(codecType, audioData)
+            if !signals.isEmpty {
+                await signalCallback?(signals)
             }
         }
+
+        // Handle frames — single binary or batch array of complete frame bytes.
+        let frameValue = dict[MessagePackValue.uint(UInt64(LXSTField.frames))]
+            ?? dict[MessagePackValue.int(Int64(LXSTField.frames))]
+        guard let frameValue = frameValue else { return }
+
+        switch frameValue {
+        case .binary(let d) where d.count >= 2:
+            // Single frame: bytes(codec_type + opus_data)
+            await deliverFrame(codecHeader: d[d.startIndex], audioData: Data(d[(d.startIndex + 1)...]))
+
+        case .array(let arr):
+            // Batch: [frame1_bytes, frame2_bytes, ...]
+            // Each element is bytes(codec_type + opus_data). Deliver all frames.
+            for elem in arr {
+                guard case .binary(let d) = elem, d.count >= 2 else { continue }
+                await deliverFrame(codecHeader: d[d.startIndex], audioData: Data(d[(d.startIndex + 1)...]))
+            }
+
+        default:
+            break
+        }
+    }
+
+    private func deliverFrame(codecHeader: UInt8, audioData: Data) async {
+        guard let codecType = LXSTCodecType(rawValue: codecHeader) else { return }
+        if codecType != currentCodecType {
+            currentCodecType = codecType
+        }
+        await frameCallback?(codecType, audioData)
     }
 }

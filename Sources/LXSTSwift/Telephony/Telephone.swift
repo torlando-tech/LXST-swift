@@ -60,6 +60,15 @@ public actor Telephone {
     /// Callback for delivering decoded PCM audio to the UI layer.
     private var decodedAudioCallback: (@Sendable ([Float], Int, Int) async -> Void)?
 
+    /// Callback fired when the remote peer's preferred profile is negotiated.
+    private var profileNegotiatedCallback: (@Sendable (TelephonyProfile) async -> Void)?
+
+    /// Frame send counter for diagnostics.
+    private var sentFrameCount: Int = 0
+
+    /// Frame receive counter for diagnostics.
+    private var receivedFrameCount: Int = 0
+
     // MARK: - Configuration
 
     /// Caller filtering. Python Telephony.py:123-124
@@ -137,6 +146,17 @@ public actor Telephone {
         self.endedCallback = callback
     }
 
+    /// Set callback fired when the remote sends a preferred profile signal.
+    ///
+    /// Called as soon as the remote's profile is known, before the call is established.
+    /// Use this to configure the local audio pipeline (AudioManager) with the right
+    /// codec parameters before `establishedCallback` fires.
+    public func setProfileNegotiatedCallback(
+        _ callback: (@Sendable (TelephonyProfile) async -> Void)?
+    ) {
+        self.profileNegotiatedCallback = callback
+    }
+
     /// Set callback for receiving decoded PCM audio frames from the remote peer.
     ///
     /// Called by CallManager to receive audio for playback. Parameters:
@@ -163,6 +183,10 @@ public actor Telephone {
               let pipeline = audioPipeline,
               let codec = codec else { return }
 
+        sentFrameCount += 1
+        if sentFrameCount == 1 || sentFrameCount % 50 == 0 {
+            logger.error("[TELEPHONE] Sending frame #\(self.sentFrameCount, privacy: .public), samples=\(samples.count, privacy: .public)")
+        }
         await pipeline.processCapture(samples, codec: codec)
     }
 
@@ -188,6 +212,11 @@ public actor Telephone {
         // Set packet callback for signalling
         await link.setPacketCallback { [weak self] data, packet in
             await self?.handlePacket(data: data, packet: packet)
+        }
+
+        // Notify when caller closes the link (remote hangup or network failure)
+        await link.setCloseCallback { [weak self] reason in
+            await self?.handleLinkClosed(reason: reason)
         }
 
         // Set identify callback to receive caller identity
@@ -271,6 +300,9 @@ public actor Telephone {
             await sendSignal(.rejected, on: link)
         }
 
+        // Clear close callback before closing so we don't get a spurious handleLinkClosed
+        await link.setCloseCallback(nil)
+
         let linkState = await link.state
         if linkState.isEstablished {
             await link.close()
@@ -281,6 +313,7 @@ public actor Telephone {
         resetCallState()
         transitionState(to: .ended(reason))
         await endedCallback?(remote, reason)
+        transitionState(to: .idle)
     }
 
     // MARK: - Outgoing Call
@@ -334,6 +367,11 @@ public actor Telephone {
             await self?.handlePacket(data: data, packet: packet)
         }
 
+        // Notify when remote closes the link (remote hangup or network failure)
+        await link.setCloseCallback { [weak self] reason in
+            await self?.handleLinkClosed(reason: reason)
+        }
+
         // Start connect timeout
         startConnectTimeout()
 
@@ -346,7 +384,12 @@ public actor Telephone {
     ///
     /// Python `signalling_received()`: Dispatch signals.
     private func handlePacket(data: Data, packet: Packet) async {
-        guard let parsed = try? LXSTWireFormat.unpack(data) else { return }
+        let first4 = data.prefix(4).map { String(format: "%02x", $0) }.joined()
+        logger.error("[TELEPHONE] handlePacket: \(data.count, privacy: .public) bytes, first4=\(first4, privacy: .public)")
+        guard let parsed = try? LXSTWireFormat.unpack(data) else {
+            logger.error("[TELEPHONE] unpack FAILED for \(data.count, privacy: .public) bytes, first4=\(first4, privacy: .public)")
+            return
+        }
 
         switch parsed {
         case .signals(let signals):
@@ -357,11 +400,35 @@ public actor Telephone {
             for signal in signals {
                 await handleSignal(signal)
             }
+            // Also route the audio frame portion to the pipeline.
+            await routeAudioFrame(data: data, packet: packet)
         case .frame:
-            // Route audio frame to pipeline via link source
-            if let source = linkSource {
-                await source.handlePacket(data: data, packet: packet)
+            await routeAudioFrame(data: data, packet: packet)
+        }
+    }
+
+    /// Route an audio frame packet to the link source for decoding.
+    ///
+    /// Auto-starts the audio pipeline if CONNECTING/ESTABLISHED were never received
+    /// (Android's Chaquopy bridge doesn't reliably deliver those signals).
+    private func routeAudioFrame(data: Data, packet: Packet) async {
+        receivedFrameCount += 1
+        if receivedFrameCount == 1 || receivedFrameCount % 50 == 0 {
+            logger.error("[TELEPHONE] Received audio frame #\(self.receivedFrameCount, privacy: .public), bytes=\(data.count, privacy: .public)")
+        }
+        if linkSource == nil {
+            logger.error("[TELEPHONE] Auto-starting audio pipeline on first frame (CONNECTING not received)")
+            await startAudioPipeline()
+            cancelTimers()
+            transitionState(to: .established)
+            if let remote = remoteIdentity {
+                await establishedCallback?(remote)
             }
+        }
+        if let source = linkSource {
+            await source.handlePacket(data: data, packet: packet)
+        } else {
+            logger.error("[TELEPHONE] Received audio frame but linkSource still nil after auto-start!")
         }
     }
 
@@ -374,7 +441,8 @@ public actor Telephone {
         // Check for preferred profile signal (>= 0xFF)
         if let profile = LXSTWireFormat.extractPreferredProfile(from: signal) {
             activeProfile = profile
-            logger.info("[TELEPHONE] Remote preferred profile: \(profile.displayName)")
+            logger.error("[TELEPHONE] Remote preferred profile: \(profile.displayName, privacy: .public)")
+            await profileNegotiatedCallback?(profile)
             return
         }
 
@@ -389,6 +457,7 @@ public actor Telephone {
             resetCallState()
             transitionState(to: .ended(.busy))
             await endedCallback?(remote, .busy)
+            transitionState(to: .idle)
 
         case .rejected:
             logger.error("[TELEPHONE] Remote REJECTED call")
@@ -398,6 +467,7 @@ public actor Telephone {
             resetCallState()
             transitionState(to: .ended(.rejected))
             await endedCallback?(remote, .rejected)
+            transitionState(to: .idle)
 
         case .available:
             // Callee is available — send identification
@@ -492,6 +562,7 @@ public actor Telephone {
         resetCallState()
         transitionState(to: .ended(endReason))
         await endedCallback?(remote, endReason)
+        transitionState(to: .idle)
     }
 
     // MARK: - Audio Pipeline Management
@@ -511,18 +582,23 @@ public actor Telephone {
             if let opusProfile = profile.opusProfile,
                let opus = try? OpusCodec(profile: opusProfile) {
                 activeCodec = opus
+                logger.error("[TELEPHONE] Using OpusCodec: \(opusProfile.sampleRate)Hz, \(opusProfile.channels)ch, \(profile.frameTimeMs)ms")
             } else {
                 activeCodec = NullCodec()
+                logger.error("[TELEPHONE] OpusCodec creation FAILED — falling back to NullCodec")
             }
         case .codec2:
             if let c2Mode = profile.codec2Mode,
                let c2 = try? Codec2Codec(mode: c2Mode) {
                 activeCodec = c2
+                logger.error("[TELEPHONE] Using Codec2Codec: mode=\(String(describing: c2Mode))")
             } else {
                 activeCodec = NullCodec()
+                logger.error("[TELEPHONE] Codec2Codec creation FAILED — falling back to NullCodec")
             }
         default:
             activeCodec = NullCodec()
+            logger.error("[TELEPHONE] Using NullCodec for profile \(profile.displayName)")
         }
         self.codec = activeCodec
 
@@ -561,7 +637,7 @@ public actor Telephone {
         await pipeline.start(codec: activeCodec)
         await source.start()
 
-        logger.info("[TELEPHONE] Audio pipeline started: codec=\(String(describing: activeCodec.codecType)), profile=\(profile.displayName)")
+        logger.error("[TELEPHONE] Audio pipeline started: codec=\(String(describing: activeCodec.codecType)), profile=\(profile.displayName)")
     }
 
     /// Stop and tear down the audio pipeline.
@@ -584,6 +660,8 @@ public actor Telephone {
         remoteIdentity = nil
         isIncoming = false
         activeProfile = nil
+        sentFrameCount = 0
+        receivedFrameCount = 0
     }
 
     // MARK: - Caller Filtering
@@ -636,6 +714,7 @@ public actor Telephone {
         resetCallState()
         transitionState(to: .ended(.ringTimeout))
         await endedCallback?(remote, .ringTimeout)
+        transitionState(to: .idle)
     }
 
     private func handleConnectTimeout() async {
@@ -648,6 +727,7 @@ public actor Telephone {
         resetCallState()
         transitionState(to: .ended(.connectTimeout))
         await endedCallback?(remote, .connectTimeout)
+        transitionState(to: .idle)
     }
 }
 

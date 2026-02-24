@@ -153,7 +153,10 @@ public actor AudioPipeline {
     /// When a jitter buffer is active, decoded frames are enqueued for playout.
     /// Otherwise, frames are delivered directly to the callback (legacy path).
     public func processReceived(_ data: Data, codec: any AudioCodec) async {
-        guard isRunning else { return }
+        guard isRunning else {
+            logger.error("[PIPELINE] processReceived called but isRunning=false")
+            return
+        }
 
         do {
             let int16Samples = try codec.decode(data)
@@ -161,6 +164,11 @@ public actor AudioPipeline {
 
             if let jitterBuffer {
                 await jitterBuffer.enqueue(floatSamples)
+                let depth = await jitterBuffer.depth
+                let primed = await jitterBuffer.isPrimed
+                if depth == 1 || (depth % 10 == 0) {
+                    logger.error("[PIPELINE] Jitter depth=\(depth, privacy: .public) primed=\(primed, privacy: .public) samples=\(floatSamples.count, privacy: .public)")
+                }
             } else {
                 await decodedSamplesCallback?(floatSamples, config.sampleRate, config.channels)
             }

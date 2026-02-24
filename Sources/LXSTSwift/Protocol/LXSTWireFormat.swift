@@ -102,9 +102,12 @@ public enum LXSTWireFormat {
         var signals: [UInt]?
         var frame: (UInt8, Data)?
 
-        // Check for signalling field
-        let sigKey = MessagePackValue.uint(UInt64(LXSTField.signalling))
-        if let sigValue = dict[sigKey] {
+        // Check for signalling field.
+        // Android/Python encode small int keys as signed (positive fixint → .int),
+        // so we must try both .uint and .int to handle cross-platform msgpack encoders.
+        let sigValue = dict[MessagePackValue.uint(UInt64(LXSTField.signalling))]
+            ?? dict[MessagePackValue.int(Int64(LXSTField.signalling))]
+        if let sigValue = sigValue {
             switch sigValue {
             case .array(let arr):
                 signals = arr.compactMap { elem -> UInt? in
@@ -121,16 +124,23 @@ public enum LXSTWireFormat {
             }
         }
 
-        // Check for frames field
-        let frameKey = MessagePackValue.uint(UInt64(LXSTField.frames))
-        if let frameValue = dict[frameKey] {
+        // Check for frames field (same uint/int dual-lookup for cross-platform compat).
+        let frameValue = dict[MessagePackValue.uint(UInt64(LXSTField.frames))]
+            ?? dict[MessagePackValue.int(Int64(LXSTField.frames))]
+        if let frameValue = frameValue {
             let frameBytes: Data
             switch frameValue {
             case .binary(let d):
                 frameBytes = d
-            case .array(let arr) where arr.count == 1:
-                if case .binary(let d) = arr[0] { frameBytes = d }
-                else { frameBytes = Data() }
+            case .array(let arr):
+                // Array format: either single-element [frame_bytes] or batch [f1, f2, ...]
+                // Each element is bytes(codec_type + opus_data).
+                // Use the first element for routing — LinkSource handles full batch delivery.
+                if let first = arr.first, case .binary(let d) = first {
+                    frameBytes = d
+                } else {
+                    frameBytes = Data()
+                }
             default:
                 frameBytes = Data()
             }
