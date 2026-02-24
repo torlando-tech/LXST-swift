@@ -77,6 +77,12 @@ public actor AudioPipeline {
     /// Active codec reference for PLC generation during underruns.
     private var activeCodec: (any AudioCodec)?
 
+    /// Consecutive playout-loop ticks where the jitter buffer was empty after priming.
+    /// PLC is only generated after several consecutive empty ticks to avoid injecting
+    /// garbage frames at normal inter-batch boundaries (Android TX_BATCH_SIZE=3 sends
+    /// every ~60ms, leaving the buffer empty between batches for up to one batch period).
+    private var emptyTickCount: Int = 0
+
     public init(config: Config) {
         self.config = config
     }
@@ -120,16 +126,29 @@ public actor AudioPipeline {
         playoutTask = nil
         activeCodec = nil
         jitterBuffer = nil
+        emptyTickCount = 0
         logger.info("[PIPELINE] Stopped")
     }
 
-    /// Computed target depth based on frame time.
+    /// Frames to accumulate before starting playout (priming window).
+    ///
+    /// With data-driven delivery (processReceived drains immediately), the player
+    /// node gets exactly one batch of frames per batch interval. Since Android sends
+    /// TX_BATCH_SIZE=3 frames every 60ms and we play 3 frames in 60ms, the
+    /// steady-state player queue hits zero exactly when each new batch arrives.
+    ///
+    /// targetDepth MUST equal TX_BATCH_SIZE (3) so priming occurs at end of the
+    /// first batch. Setting targetDepth > TX_BATCH_SIZE delays priming to batch 2+,
+    /// which causes ~60ms of initial silence perceived as "no audio."
+    ///
+    /// Remaining inter-batch clicks (from network jitter) require a ring-buffer
+    /// AudioUnit approach to fix properly (replacing AVAudioPlayerNode).
     private var playoutTargetDepth: Int {
         switch config.frameTimeMs {
-        case ...10: return 4   // 40ms total
-        case ...20: return 3   // 60ms total
-        case ...60: return 3   // 180ms total
-        default:    return 2   // high-latency profiles
+        case ...10: return 4   // 40ms priming
+        case ...20: return 3   // 60ms priming (= TX_BATCH_SIZE; must not exceed 3)
+        case ...60: return 3   // 180ms priming
+        default:    return 2
         }
     }
 
@@ -150,8 +169,9 @@ public actor AudioPipeline {
 
     /// Process received encoded data through the decode pipeline.
     ///
-    /// When a jitter buffer is active, decoded frames are enqueued for playout.
-    /// Otherwise, frames are delivered directly to the callback (legacy path).
+    /// Decodes and enqueues to the jitter buffer. Once primed, immediately drains
+    /// all available frames to the player node — this is data-driven scheduling,
+    /// avoiding the timer-jitter gaps of a periodic playout loop.
     public func processReceived(_ data: Data, codec: any AudioCodec) async {
         guard isRunning else {
             logger.error("[PIPELINE] processReceived called but isRunning=false")
@@ -164,10 +184,15 @@ public actor AudioPipeline {
 
             if let jitterBuffer {
                 await jitterBuffer.enqueue(floatSamples)
-                let depth = await jitterBuffer.depth
-                let primed = await jitterBuffer.isPrimed
-                if depth == 1 || (depth % 10 == 0) {
-                    logger.error("[PIPELINE] Jitter depth=\(depth, privacy: .public) primed=\(primed, privacy: .public) samples=\(floatSamples.count, privacy: .public)")
+
+                // If primed, immediately drain all ready frames to the player node.
+                // This is data-driven: the player node gets frames the instant they're
+                // decoded rather than waiting up to 20ms for the next timer tick.
+                if await jitterBuffer.isPrimed {
+                    while let ready = await jitterBuffer.dequeue() {
+                        emptyTickCount = 0   // real data arrived — reset PLC grace counter
+                        await decodedSamplesCallback?(ready, config.sampleRate, config.channels)
+                    }
                 }
             } else {
                 await decodedSamplesCallback?(floatSamples, config.sampleRate, config.channels)
@@ -179,23 +204,43 @@ public actor AudioPipeline {
 
     // MARK: - Playout Loop
 
-    /// Start the periodic playout loop that dequeues from the jitter buffer.
+    /// PLC fallback loop: fires every frame interval but only generates concealment audio
+    /// when no real data has arrived. Normal frame delivery is data-driven in processReceived.
     private func startPlayoutLoop() {
         let intervalNs = UInt64(config.frameTimeMs) * 1_000_000
         playoutTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
-                if let samples = await self.jitterBuffer?.dequeue() {
-                    await self.decodedSamplesCallback?(
-                        samples, self.config.sampleRate, self.config.channels)
-                } else if await (self.jitterBuffer?.isPrimed ?? false) {
-                    let plc = await self.generatePLC()
-                    await self.decodedSamplesCallback?(
-                        plc, self.config.sampleRate, self.config.channels)
+                // Only generate PLC after multiple consecutive empty ticks — this
+                // avoids injecting PLC at normal inter-batch boundaries (Android sends
+                // every ~60ms so the buffer is legitimately empty between batches).
+                // Grace period: 4 ticks × frameTimeMs = 80ms for 20ms frames.
+                let depth = await self.jitterBuffer?.depth ?? 0
+                let primed = await self.jitterBuffer?.isPrimed ?? false
+                if primed && depth == 0 {
+                    let shouldPLC = await self.incrementEmptyTick()
+                    if shouldPLC {
+                        let plc = await self.generatePLC()
+                        await self.decodedSamplesCallback?(
+                            plc, self.config.sampleRate, self.config.channels)
+                    }
+                } else {
+                    await self.resetEmptyTick()
                 }
                 try? await Task.sleep(nanoseconds: intervalNs)
             }
         }
+    }
+
+    /// Increment empty-tick counter; returns true if PLC grace period (4 ticks) has elapsed.
+    private func incrementEmptyTick() -> Bool {
+        emptyTickCount += 1
+        return emptyTickCount >= 4
+    }
+
+    /// Reset empty-tick counter (called when real frames arrive).
+    private func resetEmptyTick() {
+        emptyTickCount = 0
     }
 
     /// Generate PLC samples from the active codec, or silence as fallback.
