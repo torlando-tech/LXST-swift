@@ -148,7 +148,7 @@ public actor AudioPipeline {
         case ...10: return 4   // 40ms priming
         case ...20: return 3   // 60ms priming (= TX_BATCH_SIZE; must not exceed 3)
         case ...60: return 3   // 180ms priming
-        default:    return 2
+        default:    return 1   // long frames (320ms+): start on first frame, avoid 640ms delay
         }
     }
 

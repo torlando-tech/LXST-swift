@@ -417,6 +417,10 @@ public actor Telephone {
             logger.error("[TELEPHONE] Received audio frame #\(self.receivedFrameCount, privacy: .public), bytes=\(data.count, privacy: .public)")
         }
         if linkSource == nil {
+            guard callState != .idle else {
+                logger.error("[TELEPHONE] Dropping stray audio frame received after hangup (callState=idle)")
+                return
+            }
             logger.error("[TELEPHONE] Auto-starting audio pipeline on first frame (CONNECTING not received)")
             await startAudioPipeline()
             cancelTimers()
