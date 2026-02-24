@@ -119,7 +119,8 @@ public actor Telephone {
         // Register destination with transport for incoming links
         await transport.registerDestination(destination)
 
-        logger.info("[TELEPHONE] Listening on \(self.destination.hash.prefix(8).map { String(format: "%02x", $0) }.joined())")
+        let destHex = self.destination.hash.prefix(8).map { String(format: "%02x", $0) }.joined()
+        logger.error("[TELEPHONE] Listening on \(destHex, privacy: .public)")
     }
 
     // MARK: - Callback Setters
@@ -176,7 +177,7 @@ public actor Telephone {
     public func handleIncomingLink(_ link: Link) async {
         // Check if already in a call
         if activeCall != nil || callState != .idle {
-            logger.info("[TELEPHONE] Incoming call, but line busy — signalling BUSY")
+            logger.error("[TELEPHONE] Incoming call, but line busy — signalling BUSY")
             await sendSignal(.busy, on: link)
             await link.close()
             return
@@ -196,7 +197,7 @@ public actor Telephone {
         activeCall = link
         transitionState(to: .available)
         await sendSignal(.available, on: link)
-        logger.info("[TELEPHONE] Sent AVAILABLE to incoming link")
+        logger.error("[TELEPHONE] Sent AVAILABLE to incoming link")
     }
 
     /// Handle caller identification (LINKIDENTIFY received).
@@ -211,7 +212,7 @@ public actor Telephone {
 
         // Check if caller is allowed
         if !isAllowed(remoteId) {
-            logger.info("[TELEPHONE] Caller \(remoteId.hash.prefix(4).map { String(format: "%02x", $0) }.joined()) not allowed, BUSY")
+            logger.error("[TELEPHONE] Caller \(remoteId.hash.prefix(4).map { String(format: "%02x", $0) }.joined(), privacy: .public) not allowed, BUSY")
             await sendSignal(.busy, on: link)
             await link.close()
             resetCallState()
@@ -221,7 +222,7 @@ public actor Telephone {
         remoteIdentity = remoteId
         transitionState(to: .ringing)
         await sendSignal(.ringing, on: link)
-        logger.info("[TELEPHONE] Sent RINGING")
+        logger.error("[TELEPHONE] Sent RINGING")
 
         // Notify callback
         await ringingCallback?(remoteId)
@@ -298,7 +299,9 @@ public actor Telephone {
 
         isIncoming = false
         activeProfile = profile
+        self.remoteIdentity = remoteIdentity  // Store so establishedCallback fires on ESTABLISHED
         transitionState(to: .calling)
+        logger.error("[TELEPHONE] call() entered, creating destination")
 
         // Create outbound destination
         let callDest = Destination(
@@ -308,25 +311,33 @@ public actor Telephone {
             type: .single,
             direction: .out
         )
+        let destHex = callDest.hash.map { String(format: "%02x", $0) }.joined()
+        logger.error("[TELEPHONE] callDest hash=\(destHex, privacy: .public)")
 
-        // Create link
-        let link = Link(destination: callDest, identity: identity)
+        // Ensure a path to the telephony destination exists.
+        // If not cached, this sends a PATH REQUEST and waits up to 10s for a response.
+        // Without a path, the relay can't route our LINKREQUEST to the remote peer.
+        logger.error("[TELEPHONE] Awaiting path to telephony destination...")
+        let pathFound = await transport.awaitPath(for: callDest.hash, timeout: 10.0)
+        logger.error("[TELEPHONE] Path found: \(pathFound, privacy: .public)")
+
+        // Use transport.initiateLink() which:
+        //   1. Checks the path (throws noPathAvailable if still missing)
+        //   2. Creates the Link and registers it in pendingLinks
+        //   3. Sends the LINKREQUEST — so LINKPROOF is matched correctly when it arrives
+        let link = try await transport.initiateLink(to: callDest, identity: identity)
         activeCall = link
+        logger.error("[TELEPHONE] Link initiated, setting packet callback")
 
-        // Set packet callback for signalling
+        // Set packet callback for DATA signalling packets (arrives after link is established)
         await link.setPacketCallback { [weak self] data, packet in
             await self?.handlePacket(data: data, packet: packet)
         }
 
-        // Register link with transport and send request
-        let requestPacket = try await link.getLinkRequestPacket()
-        await link.markRequestSent()
-        try await transport.send(packet: requestPacket)
-
         // Start connect timeout
         startConnectTimeout()
 
-        logger.info("[TELEPHONE] Outgoing call initiated")
+        logger.error("[TELEPHONE] Outgoing call initiated")
     }
 
     // MARK: - Signal Handling
@@ -371,7 +382,7 @@ public actor Telephone {
 
         switch signalCode {
         case .busy:
-            logger.info("[TELEPHONE] Remote is BUSY")
+            logger.error("[TELEPHONE] Remote is BUSY")
             cancelTimers()
             let remote = remoteIdentity
             await link.close()
@@ -380,7 +391,7 @@ public actor Telephone {
             await endedCallback?(remote, .busy)
 
         case .rejected:
-            logger.info("[TELEPHONE] Remote REJECTED call")
+            logger.error("[TELEPHONE] Remote REJECTED call")
             cancelTimers()
             let remote = remoteIdentity
             await link.close()
@@ -390,13 +401,13 @@ public actor Telephone {
 
         case .available:
             // Callee is available — send identification
-            logger.info("[TELEPHONE] Remote AVAILABLE, identifying...")
+            logger.error("[TELEPHONE] Remote AVAILABLE, identifying...")
             transitionState(to: .available)
             try? await link.identify(identity: identity)
 
         case .ringing:
             // Callee is ringing — send preferred profile
-            logger.info("[TELEPHONE] Remote is RINGING")
+            logger.error("[TELEPHONE] Remote is RINGING")
             transitionState(to: .ringing)
             if let profile = activeProfile {
                 await sendPreferredProfile(profile, on: link)
@@ -405,7 +416,7 @@ public actor Telephone {
 
         case .connecting:
             // Callee answered, setting up pipelines
-            logger.info("[TELEPHONE] Remote CONNECTING")
+            logger.error("[TELEPHONE] Remote CONNECTING")
             transitionState(to: .connecting)
             cancelTimers()
             await startAudioPipeline()
@@ -413,7 +424,7 @@ public actor Telephone {
         case .established:
             // Call fully established
             if !isIncoming {
-                logger.info("[TELEPHONE] Call ESTABLISHED (outgoing)")
+                logger.error("[TELEPHONE] Call ESTABLISHED (outgoing)")
                 transitionState(to: .established)
                 cancelTimers()
                 if let remote = remoteIdentity {
@@ -617,7 +628,7 @@ public actor Telephone {
 
     private func handleRingTimeout() async {
         guard callState == .ringing else { return }
-        logger.info("[TELEPHONE] Ring timeout")
+        logger.error("[TELEPHONE] Ring timeout")
         let remote = remoteIdentity
         if let link = activeCall {
             await link.close()
@@ -629,7 +640,7 @@ public actor Telephone {
 
     private func handleConnectTimeout() async {
         guard callState == .calling || callState == .available else { return }
-        logger.info("[TELEPHONE] Connect timeout")
+        logger.error("[TELEPHONE] Connect timeout")
         let remote = remoteIdentity
         if let link = activeCall {
             await link.close()
