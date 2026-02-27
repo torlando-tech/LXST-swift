@@ -530,6 +530,80 @@ final class OpusPLCTests: XCTestCase {
 }
 #endif
 
+final class OpusRoundTripTests: XCTestCase {
+
+    /// Verify voiceMax (48kHz, 2ch) roundtrip produces audible audio
+    func testVoiceMaxRoundTrip() throws {
+        #if canImport(COpus)
+        let profile = OpusProfile.voiceMax  // 48kHz, 2ch, voip
+        let codec = try OpusCodec(profile: profile)
+        let samplesPerChannel = profile.sampleRate * 60 / 1000 // 60ms = 2880
+        let totalSamples = samplesPerChannel * profile.channels // 5760
+
+        // Generate 60ms stereo sine wave at 440Hz
+        var pcm = [Int16](repeating: 0, count: totalSamples)
+        for i in 0..<samplesPerChannel {
+            let sample = Int16(clamping: Int(sin(Double(i) * 2.0 * .pi * 440.0 / Double(profile.sampleRate)) * 10000))
+            for c in 0..<profile.channels {
+                pcm[i * profile.channels + c] = sample
+            }
+        }
+        let inputPeak = pcm.reduce(Int16(0)) { Swift.max($0, abs($1)) }
+        print("Input peak: \(inputPeak)")
+
+        // Encode
+        let encoded = try codec.encode(pcm)
+        print("Encoded: \(encoded.count) bytes")
+        print("First 8: \(encoded.prefix(8).map { String(format: "%02x", $0) }.joined(separator: " "))")
+
+        // Decode
+        let decoded = try codec.decode(encoded)
+        let outputPeak = decoded.reduce(Int16(0)) { Swift.max($0, abs($1)) }
+        print("Decoded: \(decoded.count) samples, peak=\(outputPeak)")
+
+        XCTAssertEqual(decoded.count, totalSamples)
+        XCTAssertGreaterThan(outputPeak, 1000, "Decoded audio should be audible, got peak=\(outputPeak)")
+        #endif
+    }
+
+    /// Test what happens when mono Opus data is decoded with a stereo decoder
+    func testMonoDataStereoDecoder() throws {
+        #if canImport(COpus)
+        // Encode mono
+        let monoProfile = OpusProfile.voiceHigh  // 48kHz, 1ch
+        let monoCodec = try OpusCodec(profile: monoProfile)
+        let spf = monoProfile.sampleRate * 60 / 1000 // 2880
+
+        var monoInput = [Int16](repeating: 0, count: spf)
+        for i in 0..<spf {
+            monoInput[i] = Int16(clamping: Int(sin(Double(i) * 2.0 * .pi * 440.0 / Double(monoProfile.sampleRate)) * 10000))
+        }
+        let monoEncoded = try monoCodec.encode(monoInput)
+        print("Mono encoded: \(monoEncoded.count) bytes")
+        print("Mono first 8: \(monoEncoded.prefix(8).map { String(format: "%02x", $0) }.joined(separator: " "))")
+
+        // Decode with stereo decoder
+        let stereoProfile = OpusProfile.voiceMax  // 48kHz, 2ch
+        let stereoCodec = try OpusCodec(profile: stereoProfile)
+
+        do {
+            let decoded = try stereoCodec.decode(monoEncoded)
+            let peak = decoded.reduce(Int16(0)) { Swift.max($0, abs($1)) }
+            print("Stereo decode of mono data: \(decoded.count) samples, peak=\(peak)")
+            // If this succeeds, it means Opus CAN decode mono with stereo decoder
+            // Check if peak is near-zero (would explain our bug!)
+            if peak < 100 {
+                print("WARNING: Stereo decoder of mono data produces near-zero peak=\(peak)")
+                print("THIS COULD BE THE BUG — Android may be sending mono Opus!")
+            }
+        } catch {
+            print("Stereo decode of mono data FAILED: \(error)")
+            // If it fails, channel mismatch causes error, not silence
+        }
+        #endif
+    }
+}
+
 final class AudioPipelineTests: XCTestCase {
 
     func testConfigFromProfile() {
@@ -626,3 +700,218 @@ final class AudioPipelineTests: XCTestCase {
         XCTAssertEqual(decodedBox.value?.count, samplesPerFrame)
     }
 }
+
+// MARK: - Opus Stereo Interop Tests
+
+#if canImport(COpus)
+import COpus
+
+final class OpusStereoInteropTests: XCTestCase {
+
+    /// Decode a Hybrid FB stereo 20ms frame containing a 440Hz test tone.
+    /// Generated with libopus forced to Hybrid mode (SILK+CELT) at 48kHz/32kbps —
+    /// the same encoding Android uses for SHQ profile.
+    /// TOC 0x7c = config 15 (Hybrid FB 20ms), stereo, code 0 (single frame).
+    func testDecodeHybridFrame20ms() throws {
+        let b64 = "fIgDJQllHYiSy+oxGUlp7xO7H28qCQ3yV7leJS7+xqPzXzITPyCEBJPFtP4W73OTG516cfMCuXvgRfrxVEwK"
+        let data = Data(base64Encoded: b64)!
+        XCTAssertEqual(data[0], 0x7c, "TOC byte should be 0x7c (Hybrid FB stereo code 0)")
+        let config = Int(data[0]) >> 3
+        XCTAssertEqual(config, 15, "Config should be 15 (Hybrid FB 20ms)")
+
+        var error: Int32 = 0
+        guard let decoder = opus_decoder_create(48000, 2, &error) else {
+            XCTFail("Failed to create decoder: \(error)")
+            return
+        }
+        defer { opus_decoder_destroy(decoder) }
+
+        var pcm = [Int16](repeating: 0, count: 960 * 2) // 20ms stereo
+        let decoded = data.withUnsafeBytes { rawPtr -> Int32 in
+            let bytes = rawPtr.bindMemory(to: UInt8.self)
+            return opus_decode(decoder, bytes.baseAddress, Int32(data.count),
+                             &pcm, 960, 0)
+        }
+
+        XCTAssertEqual(decoded, 960, "Should decode 960 samples per channel (20ms)")
+        let peak = pcm.prefix(Int(decoded) * 2).reduce(Int16(0)) { Swift.max($0, abs($1)) }
+        XCTAssertGreaterThan(peak, 1000, "Hybrid 20ms decode peak=\(peak) — should contain audible 440Hz tone")
+    }
+
+    /// Decode a Hybrid FB stereo 60ms frame (code 3, 3×20ms) containing a 440Hz test tone.
+    /// This matches the exact format Android sends for SHQ calls:
+    /// TOC 0x7f = config 15 (Hybrid FB 20ms), stereo, code 3 (VBR, 3 frames).
+    func testDecodeHybridFrame60ms() throws {
+        let b64 = "f4NIT4gCmqU4WH0AFo0dYtNT0+2qZ7ejPRKQx3CUwTp9q5wCFA1GqaO2UIZ3v10hxkVa9NH3rYZPLd0rPLeUe62O67aHL5Sd1+5wCogCmqU4WH0AFdNVW3gU/qTxqnrHeX80jGtIc8ucoMBBZqXgfzgrqxRKuutQGjWF8bo4kIfIm6iTIDrT9KtE02gUOTsAF7yyhjPNKIUPkPWIApqlOFh7Kc4ZNNmuoFt/pt5nYoS4z1yGDzP82CBA2FFIka19C5qfZ02qOCNloHB5J5lKuVCbzu84HEhinP/OFH/U1uQeAPtLLx1UbzwP"
+        let data = Data(base64Encoded: b64)!
+        XCTAssertEqual(data[0], 0x7f, "TOC byte should be 0x7f (Hybrid FB stereo code 3)")
+        let config = Int(data[0]) >> 3
+        XCTAssertEqual(config, 15, "Config should be 15 (Hybrid FB 20ms)")
+
+        var error: Int32 = 0
+        guard let decoder = opus_decoder_create(48000, 2, &error) else {
+            XCTFail("Failed to create decoder: \(error)")
+            return
+        }
+        defer { opus_decoder_destroy(decoder) }
+
+        var pcm = [Int16](repeating: 0, count: 2880 * 2) // 60ms stereo
+        let decoded = data.withUnsafeBytes { rawPtr -> Int32 in
+            let bytes = rawPtr.bindMemory(to: UInt8.self)
+            return opus_decode(decoder, bytes.baseAddress, Int32(data.count),
+                             &pcm, 2880, 0)
+        }
+
+        XCTAssertEqual(decoded, 2880, "Should decode 2880 samples per channel (60ms)")
+        let peak = pcm.prefix(Int(decoded) * 2).reduce(Int16(0)) { Swift.max($0, abs($1)) }
+        XCTAssertGreaterThan(peak, 1000, "Hybrid 60ms decode peak=\(peak) — should contain audible 440Hz tone")
+    }
+
+    /// Test that our COpus encoder roundtrip works for stereo (baseline).
+    func testStereoRoundtrip() throws {
+        let codec = try OpusCodec(profile: .voiceMax)
+        let spf = 2880 // 60ms at 48kHz, per channel
+        let total = spf * 2 // stereo
+
+        // Generate loud 440Hz stereo sine
+        var pcm = [Int16](repeating: 0, count: total)
+        for i in 0..<spf {
+            let sample = Int16(clamping: Int(sin(Double(i) * 2.0 * .pi * 440.0 / 48000.0) * 10000))
+            pcm[i * 2] = sample
+            pcm[i * 2 + 1] = sample
+        }
+
+        let encoded = try codec.encode(pcm)
+        let tocByte = encoded[0]
+        let config = Int(tocByte) >> 3
+
+        let decoded = try codec.decode(encoded)
+        let peak = decoded.reduce(Int16(0)) { Swift.max($0, abs($1)) }
+
+        XCTAssertGreaterThan(peak, 1000, "Roundtrip peak=\(peak) TOC=0x\(String(format: "%02x", tocByte)) config=\(config) — should be substantial")
+    }
+
+    /// Cross-platform decode test: Homebrew libopus 1.6.1 encoded SILK tone → our COpus 1.5.2 decoder.
+    /// This simulates Android NDK libopus → iOS COpus. Uses OpusCodec wrapper (same code path as iOS app).
+    func testCrossPlatformSilkDecode() throws {
+        // 60ms stereo SILK frame from Homebrew libopus (440Hz tone, 48kHz/32kbps VOIP, forced SILK mode)
+        // Frame 9 (after encoder warmup), TOC=0x7f (Hybrid FB stereo code 3)
+        let b64 = "f4NESogDJQlje2O9DdiC5xu1+6ONb7+YxSAKZ8JQRUr9ZYkS9JM+Fe1VUxgjEUKeEgOf/ynzhuCa2Q7ALnLWkEQgE/rxVHCaiALCrvMOS/aF4kisywUTKFHHp8EiLkO7Aov6mehHSM02co9k8co3cmSfksfHHDymR+EOuPYVFWOEMLolgdnqHFThOHUfg4BUwAqIAq727K/M/ysWO75jr0wnLcf3TABU0dMw5DP8u2SwqSTUBnWqLrfj56lNAMTLtrPitEnc/qgAKZ3shgJl11FjIcyjpeUtc/o="
+        let data = Data(base64Encoded: b64)!
+        XCTAssertEqual(data[0], 0x7f, "TOC should be 0x7f (Hybrid/SILK FB stereo code 3)")
+
+        let codec = try OpusCodec(profile: .voiceMax) // 48kHz stereo VOIP 32kbps
+        let decoded = try codec.decode(data)
+        let peak = decoded.reduce(Int16(0)) { Swift.max($0, abs($1)) }
+
+        print("Cross-platform SILK decode: \(data.count)B → \(decoded.count) samples, peak=\(peak)")
+        XCTAssertEqual(decoded.count, 2880 * 2, "Should decode 2880 stereo samples (60ms)")
+        XCTAssertGreaterThan(peak, 1000, "Cross-platform SILK decode peak=\(peak) — should contain audible 440Hz tone (>1000). If ≤50, SILK decode is broken.")
+    }
+
+    /// Cross-platform SHQ decode test: Homebrew libopus 1.6.1 encoded frames → our COpus 1.5.2.
+    /// Simulates Android NDK libopus → iOS COpus for the SHQ profile (0x60).
+    /// Uses 10 consecutive 60ms stereo 440Hz frames (encoder warmup matters).
+    /// Generated by /tmp/encode_shq_tone.c with identical params to Android:
+    /// 48kHz, 2ch, VOIP, 32kbps, complexity 10.
+    func testDecodeAndroidSHQFrames() throws {
+        // 10 consecutive 60ms SHQ frames from Homebrew libopus 1.6.1
+        // (same NDK-style prebuilt library Android uses)
+        let frames: [String] = [
+            // Frame 0: TOC=0xff (CELT FB stereo code 3) — encoder warmup
+            "/wN7GT2sVHjt9JSvVIu6Rdr11ijk+buou2zkzC6OQO2ExW2XK/Xvg3W/qdD/0461/fbNFtM4KI2W7iv7kyrInLTjmBgPjgy/OeE/Ays8zwW3sB/JK8GDKGlHgCbESLlYTAkgFidX1rJLJAOApWLILq4Lho9fH/hrpy8tXLvWpvM6wW+k3luZON7vkygeFT6dhhaIE8FJEgqj+YbbfttJ7rAuwwgZi3hA3WSjMH7FIeV1j2QUQT4J7QmeFoTV6cfPsbK72DagQXzg5zUnKE6hfA/k9YfyvGliS7oGSDsyVOc+ttBQg1+j6sAAJSJNpe4=",
+            // Frame 1: TOC=0xff
+            "/wOsnMpGQdHr9a7A+fuR1HuW7ctlVlTeGTqUvROknmo/yWRmftbOLHGMgYA6EpNtzH2QCwjGcDjVAAtbVKgrr75rLoVuXPOI+da+AG3/8lvurFp4yHwddKwoc1we4PBLUr2v7xL979fM0gMJHo+GosLwACUxsNoYXWC2I8/P14hRyY//RSNcohb80sOdGLjVkONLdGEvXNkLefJJbskT7qytKJG9gCOm34QRpE9gpw9iDoe4NaNZu+bAbEKJI3/m+bwh/DR/eW7BifevIcOtgsdUQotqUSUj1gsvo2YK50cIK8YXbLnIJ0CktgAAJe4=",
+            // Frame 2: TOC=0xff
+            "/wOsWniCVebWPDH+3XddN9yYYOiBX+bea8kgSdfur7t0ri1RE6eVlSxsPKqj04pnB0/oZfySVoLhU7Qi+lnziGq7IbStP0uGfsR/8gH+21vusDJD++F6zh16V1ZmK+vjzI7YcScSHQMzeiUUQHb3BKJMI3wwHHlWlGpa6FZvbbMClzp2kSi6liS4UGSCmxKnOfW2gkUGCEPmBq3bJ+B/7qycykZB0OUrhqD3otHyq9GuqWt2ttgNgk5CJMZLRz6AFkk8rFfnR58zeMr5PigKWgC/dheGe2/eC1tUqCuvvmsuhW5c84j51r4Abf7W2+4=",
+            // Frame 3: TOC=0x9f (SILK FB stereo code 3) — encoder settled
+            "nwOsWnjIfB10rCjYuElCxoLh9k5c5bpdq/ueoyRe8PV6dHOETpaPCBClBXo2809tOZ6fxogQYhR5C4eKXBVrElK/ON2/isVMlKWGB8kleBPurK0okb2AI6bSsq8Zbi6buGmi+i2+gIMZnEi01/3EG+hmlB6bABIuNgXApxuG+ShS5iYmfMfPh2AO17W3uHqnCOemh5QTfo0omYKS2AAl7qxaeIJV5tY8JfgE8XLq36tNV1V1KR+8QlubkfmApp5UnITURB9guKIwIps1n2KPVMSyDLWTTgBs9XXJPohWRNQwqjLq2/pemOf/yAf/2+4=",
+            // Frame 4: TOC=0x9f
+            "nwOwMkP74XrOF3aO1iqYUdEsh7R7Lm0z6ATvjCBirRKAHbvHmZvMD36tk2/4uqJtJtNMbAXBDv5kF7vK0qxt97dRKvxjqO30Pjp4at214H/urJzKRkHQ5V+bvw3klmpOscYcV4CEtxO8rWfWAIMMlcyNPOoFeKOxExyF0vpDeMkrmHT27i6IqwDWTNmVIpscGmhdBo6ujPXGGeAH/tJb7qxaeMh8HXSsKNi4SULGguH2Tlzlul2r+56jJF7w9Xp0c4ROlo8IEKUFejbzT205np/GiBACFHkLh4pcFWsSUr843b+KxUyUpYYHySV6k+4=",
+            // Frame 5: TOC=0x9f
+            "nwOsrSiRvYAjptKyrxluLpu4aaL6Lb6AgxmcSLTX/cQb6GaUHpsAEi42BcCnG4b5KFLmJiZ8x8+HYA7Xtbe4eqcI56aHlBN+jSiZgpLYACXurFp4glXm1jwl+ATxcurfq01XVXUpH7xCW5uR+YCmnlSchNREH2C4ojAimzWfYo9UxLIMtZNOAGz1dck+iFZE1DCqMurb+l6Y5//IB//b7rAyQ/vhes4Xdo7WKphR0SyHtHsubTPoBO+MIGKtEoAdu8eZm8wPfq2Tb/i6omty9yGIBcEO/mQXu8rSrG33t1Eq/GOo7fQ+Onhq3bXgf+4=",
+            // Frame 6: TOC=0x9f
+            "nwOsnMpGQdDlX5u/DeSWak6xxhxXgIS3E7ytZ9YAgwyVzI086gV4o7ETHIXS+kN419qYdPbuLoirANZM2ZUimxwaaF0Gjq6M9cYZ4Af+0lvurFp4yHwddKubGb0BQcFteaXsKsKc6Iwwur9Sj34rAFcOa2kAA6wdaVW77UvDns52FVbVOAIUeQuHilwVaxJSvzjcvorF/zSlgAfJJXqT7qytKJG9gCOm0rKvGW4um7hpovotvoCDGZxItNf9xBvoZpQemwASLjYFwKcbhvkoUuYqJnzHz4dgDte1t7h6pwjnpoeUE36NKJmCktgAJe4=",
+            // Frame 7: TOC=0x9f
+            "nwOsWniCVebWPCX4BPFy6t+rTVdVdSkfvEJbm5H5gKaeVJyE1EQfYLiiMCKbNZ9ij1TEsgy1k04AbPV1yT6IVkTUMKoy6tv6Xpjn/8gH/9vusDJD++F6zhd2jtYqmFHRLIe0ey5tM+gE74wgYq0SgB27x5mbzA9+rZNv+Lqia3L2j+gFwQ7+ZBe7ytKsbfe3USr8Y6jt9D46eGrdteB/7qycykZB0OVfm78N5JZqTrHGHFeAhLcTvK1n1gCDDJXMjTzqBXijsRMchdL6Q3jX2ph09u4uiKsA1kzZlSKbHBpoXQaOroz1xhngB/7SW+4=",
+            // Frame 8: TOC=0x9f
+            "nwOsWnjIfB10rCjYuElCxoLh9k5c5bpdq/ueoyRe8PV6dHOETpaPCBClBXo2809tOZ6fxogQAhR5C4eKXBVrElK/ON2/isVMlKWGB8klepPurK0okb2AI6bSsq8Zbi6buGmi+i2+gIMZnEi01/3EG+hmlB6bABIuNgXApxuG+ShS5iYmfMfPh2AO17W3uHqnCOemh5QTfo0omYKS2AAl7qxaeIJV5tY8JfgE8XLq36tNV1V1KR+8QlubkfmApp5UnITURB9guKIwIps1n2KPVMSyDLWTTgBs9XXJPohWRNQwqjLq2/pemOf/yAf/2+4=",
+            // Frame 9: TOC=0x9f
+            "nwOwMkP74XrOF3aO1iqYUdEsh7R7Lm0z6ATvjCBirRKAHbvHmZvMD36tk2/4uqJrcvaP6AXBDv5kF7vK0qxt97dRKvxjqO30Pjp4at214H/urJzKRkHQ5V+bvw3klmpOscYcV4CEtxO8rWfWAIMMlcyNPOoFeKOxExyF0vpDeMkrmHT27i6IqwDWTNmVIpscGmhdBo6ujPXGGeAH/tJb7qxaeMh8HXSsKNi4SULGguH2Tlzlul2r+56jJF7w9Xp0c4ROlo8IEKUFejbzT205nla6M2AKFHkLh4pcFWsSUr843b+KxUyUpYYHySV6k+4=",
+        ]
+
+        let codec = try OpusCodec(profile: .voiceMax) // 48kHz, 2ch, VOIP, 32kbps
+
+        for (i, b64) in frames.enumerated() {
+            let data = Data(base64Encoded: b64)!
+            let toc = data[0]
+            let config = Int(toc) >> 3
+            let stereo = (Int(toc) >> 2) & 1
+
+            let decoded = try codec.decode(data)
+            let peak = decoded.reduce(Int16(0)) { Swift.max($0, abs($1)) }
+
+            print("SHQ Frame \(i): \(data.count)B TOC=0x\(String(format: "%02x", toc)) config=\(config) \(stereo == 1 ? "stereo" : "mono") → \(decoded.count) samples, peak=\(peak)")
+
+            XCTAssertEqual(decoded.count, 2880 * 2,
+                "Frame \(i) should decode to 5760 stereo samples (60ms)")
+            XCTAssertGreaterThan(peak, 1000,
+                "Frame \(i) peak=\(peak) — should be >1000 for audible 440Hz. If ≤50, COpus can't decode prebuilt libopus output.")
+        }
+    }
+
+    /// Test decoding a Hybrid-mode packet generated by forcing encoder to Hybrid.
+    /// This isolates whether SILK/Hybrid decode works in our COpus build.
+    func testHybridModeDecodeWorks() throws {
+        var error: Int32 = 0
+        guard let encoder = opus_encoder_create(48000, 2, OPUS_APPLICATION_VOIP, &error) else {
+            XCTFail("Encoder create failed: \(error)")
+            return
+        }
+        defer { opus_encoder_destroy(encoder) }
+
+        // Force Hybrid mode explicitly using the private FORCE_MODE CTL.
+        // Previous code used bandwidth=1103 (WIDEBAND) instead of 1104 (SUPERWIDEBAND),
+        // causing the encoder to produce CELT WB instead of Hybrid.
+        // OPUS_MODE_HYBRID = 1001 forces SILK+CELT combination.
+        opus_encoder_set_bitrate(encoder, 32000)
+        opus_encoder_set_complexity(encoder, 10)
+        opus_encoder_set_bandwidth(encoder, 1105) // OPUS_BANDWIDTH_FULLBAND
+        opus_encoder_set_force_mode(encoder, OPUS_MODE_HYBRID)
+
+        let spf = 960 // 20ms at 48kHz per channel
+        let total = spf * 2
+        var pcm = [Int16](repeating: 0, count: total)
+        for i in 0..<spf {
+            let sample = Int16(clamping: Int(sin(Double(i) * 2.0 * .pi * 440.0 / 48000.0) * 10000))
+            pcm[i * 2] = sample
+            pcm[i * 2 + 1] = sample
+        }
+
+        var outBuf = [UInt8](repeating: 0, count: 4000)
+        let encLen = pcm.withUnsafeBufferPointer { pcmPtr in
+            opus_encode(encoder, pcmPtr.baseAddress!, Int32(spf), &outBuf, 4000)
+        }
+        XCTAssertGreaterThan(encLen, 0, "Encode should succeed")
+
+        let tocByte = outBuf[0]
+        let config = Int(tocByte) >> 3
+
+        // Now decode
+        guard let decoder = opus_decoder_create(48000, 2, &error) else {
+            XCTFail("Decoder create failed: \(error)")
+            return
+        }
+        defer { opus_decoder_destroy(decoder) }
+
+        var decodedPcm = [Int16](repeating: 0, count: spf * 2)
+        let decodedSamples = opus_decode(decoder, outBuf, encLen, &decodedPcm, Int32(spf), 0)
+        XCTAssertEqual(decodedSamples, Int32(spf))
+
+        let peak = decodedPcm.prefix(Int(decodedSamples) * 2).reduce(Int16(0)) { Swift.max($0, abs($1)) }
+        let isHybrid = config >= 12 && config <= 15
+        XCTAssertTrue(isHybrid, "Expected Hybrid mode (config 12-15), got config=\(config) TOC=0x\(String(format: "%02x", tocByte))")
+        XCTAssertGreaterThan(peak, 100, "Hybrid decode peak=\(peak) TOC=0x\(String(format: "%02x", tocByte)) config=\(config) — near-zero means SILK/Hybrid broken")
+    }
+}
+#endif

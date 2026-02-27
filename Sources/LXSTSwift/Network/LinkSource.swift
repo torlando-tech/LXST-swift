@@ -7,6 +7,9 @@
 //
 
 import Foundation
+import os.log
+
+private let lsLogger = Logger(subsystem: "com.lxst.swift", category: "LinkSource")
 
 /// LinkSource receives audio frames from a remote peer over a Reticulum link.
 ///
@@ -111,8 +114,18 @@ public actor LinkSource {
         }
     }
 
+    private var deliverCount = 0
+
     private func deliverFrame(codecHeader: UInt8, audioData: Data) async {
-        guard let codecType = LXSTCodecType(rawValue: codecHeader) else { return }
+        deliverCount += 1
+        if deliverCount <= 5 || deliverCount % 50 == 0 {
+            let first4 = audioData.prefix(4).map { String(format: "%02x", $0) }.joined(separator: " ")
+            lsLogger.error("[LINKSOURCE] frame #\(self.deliverCount, privacy: .public): hdr=0x\(String(format: "%02x", codecHeader), privacy: .public) audioBytes=\(audioData.count, privacy: .public) first4=[\(first4, privacy: .public)]")
+        }
+        guard let codecType = LXSTCodecType(rawValue: codecHeader) else {
+            lsLogger.error("[LINKSOURCE] UNKNOWN codec header: 0x\(String(format: "%02x", codecHeader), privacy: .public) — dropping frame")
+            return
+        }
         if codecType != currentCodecType {
             currentCodecType = codecType
         }

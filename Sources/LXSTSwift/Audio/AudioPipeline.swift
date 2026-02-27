@@ -59,6 +59,9 @@ public actor AudioPipeline {
         }
     }
 
+    /// Static diagnostics for on-screen debug overlay (updated from processReceived).
+    public static var lastPipelineInfo: String = ""
+
     private let config: Config
     private var isRunning = false
 
@@ -111,6 +114,7 @@ public actor AudioPipeline {
         let target = playoutTargetDepth
         self.jitterBuffer = JitterBuffer(targetDepth: target, maxDepth: target * 3)
         startPlayoutLoop()
+        AudioPipeline.lastPipelineInfo = ""
         logger.info("[PIPELINE] Started with codec at \(self.config.sampleRate)Hz, jitter target=\(target)")
     }
 
@@ -172,6 +176,9 @@ public actor AudioPipeline {
     /// Decodes and enqueues to the jitter buffer. Once primed, immediately drains
     /// all available frames to the player node — this is data-driven scheduling,
     /// avoiding the timer-jitter gaps of a periodic playout loop.
+    private var receivedCount = 0
+    private var primedLogged = false
+
     public func processReceived(_ data: Data, codec: any AudioCodec) async {
         guard isRunning else {
             logger.error("[PIPELINE] processReceived called but isRunning=false")
@@ -181,18 +188,34 @@ public actor AudioPipeline {
         do {
             let int16Samples = try codec.decode(data)
             let floatSamples = int16ToFloat(int16Samples)
+            receivedCount += 1
+            if receivedCount == 1 || receivedCount % 50 == 0 {
+                logger.error("[PIPELINE] Decoded frame #\(self.receivedCount, privacy: .public): \(int16Samples.count, privacy: .public) int16 → \(floatSamples.count, privacy: .public) floats")
+            }
 
             if let jitterBuffer {
                 await jitterBuffer.enqueue(floatSamples)
 
-                // If primed, immediately drain all ready frames to the player node.
-                // This is data-driven: the player node gets frames the instant they're
-                // decoded rather than waiting up to 20ms for the next timer tick.
                 if await jitterBuffer.isPrimed {
+                    if !primedLogged {
+                        primedLogged = true
+                        logger.error("[PIPELINE] Jitter buffer PRIMED, starting drain")
+                    }
+                    var drained = 0
                     while let ready = await jitterBuffer.dequeue() {
-                        emptyTickCount = 0   // real data arrived — reset PLC grace counter
+                        emptyTickCount = 0
+                        drained += 1
                         await decodedSamplesCallback?(ready, config.sampleRate, config.channels)
                     }
+                    if receivedCount <= 6 {
+                        logger.error("[PIPELINE] Drained \(drained, privacy: .public) frames to callback")
+                    }
+                }
+
+                // Update static diagnostics every 10 frames for debug overlay
+                if receivedCount <= 10 || receivedCount % 10 == 0 {
+                    let stats = await jitterBuffer.stats
+                    AudioPipeline.lastPipelineInfo = "JB: d=\(stats.depth) primed=\(stats.isPrimed) enq=\(stats.totalEnqueued) deq=\(stats.totalDequeued) under=\(stats.totalUnderruns) over=\(stats.totalOverflows) ch=\(config.channels)"
                 }
             } else {
                 await decodedSamplesCallback?(floatSamples, config.sampleRate, config.channels)
