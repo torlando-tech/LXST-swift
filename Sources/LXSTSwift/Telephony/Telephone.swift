@@ -26,7 +26,7 @@ public actor Telephone {
     public let identity: Identity
 
     /// Transport instance for sending/receiving packets.
-    private let transport: ReticuLumTransport
+    private let transport: ReticulumTransport
 
     /// RNS destination for incoming calls: (identity, IN, SINGLE, "lxst", "telephony").
     public let destination: Destination
@@ -112,7 +112,7 @@ public actor Telephone {
     /// - Parameters:
     ///   - identity: Local identity for this endpoint
     ///   - transport: Transport for sending/receiving
-    public init(identity: Identity, transport: ReticuLumTransport) async {
+    public init(identity: Identity, transport: ReticulumTransport) async {
         self.identity = identity
         self.transport = transport
 
