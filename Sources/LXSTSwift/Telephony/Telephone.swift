@@ -94,6 +94,9 @@ public actor Telephone {
     /// Called when a call ends.
     private var endedCallback: (@Sendable (Identity?, CallEndReason) async -> Void)?
 
+    /// Diagnostic logging callback (set by app layer).
+    public var onDiagnostic: (@Sendable (String) -> Void)?
+
     // MARK: - Timers
 
     /// Ring timeout task.
@@ -101,6 +104,10 @@ public actor Telephone {
 
     /// Connect timeout task.
     private var connectTimeoutTask: Task<Void, Never>?
+
+    /// If true, answer() was called before the Telephone reached .ringing state.
+    /// handleCallerIdentified will auto-answer when it transitions to .ringing.
+    private var pendingAnswer: Bool = false
 
     // MARK: - Initialization
 
@@ -169,6 +176,11 @@ public actor Telephone {
         self.decodedAudioCallback = callback
     }
 
+    /// Set diagnostic logging callback.
+    public func setDiagnostic(_ callback: @escaping @Sendable (String) -> Void) {
+        self.onDiagnostic = callback
+    }
+
     // MARK: - Audio Frame Send/Receive
 
     /// Send captured audio samples to the remote peer.
@@ -181,10 +193,17 @@ public actor Telephone {
         guard callState == .established,
               activeCall != nil,
               let pipeline = audioPipeline,
-              let codec = codec else { return }
+              let codec = codec else {
+            // Log why we're dropping the frame (first few only)
+            if sentFrameCount == 0 {
+                onDiagnostic?("[TEL] sendAudioFrame DROPPED: state=\(String(describing: callState)), link=\(activeCall != nil), pipeline=\(audioPipeline != nil), codec=\(codec != nil)")
+            }
+            return
+        }
 
         sentFrameCount += 1
         if sentFrameCount == 1 || sentFrameCount % 50 == 0 {
+            onDiagnostic?("[TEL] TX frame #\(sentFrameCount): \(samples.count) samples")
             logger.error("[TELEPHONE] Sending frame #\(self.sentFrameCount, privacy: .public), samples=\(samples.count, privacy: .public)")
         }
         await pipeline.processCapture(samples, codec: codec)
@@ -253,6 +272,14 @@ public actor Telephone {
         await sendSignal(.ringing, on: link)
         logger.error("[TELEPHONE] Sent RINGING")
 
+        // If user already tapped answer before we reached .ringing, auto-answer now
+        if pendingAnswer {
+            pendingAnswer = false
+            logger.error("[TELEPHONE] Pending answer detected, auto-answering")
+            await answer()
+            return
+        }
+
         // Notify callback
         await ringingCallback?(remoteId)
 
@@ -266,23 +293,35 @@ public actor Telephone {
     ///
     /// Python `answer()`: send CONNECTING, open pipelines, send ESTABLISHED.
     public func answer() async {
+        // If not yet in .ringing (e.g., still waiting for LINKIDENTIFY),
+        // set a flag so handleCallerIdentified will auto-answer.
+        if callState != .ringing && isIncoming && activeCall != nil {
+            logger.error("[TELEPHONE] answer() called in state \(String(describing: self.callState)), deferring until .ringing")
+            pendingAnswer = true
+            return
+        }
+
         guard callState == .ringing, let link = activeCall, isIncoming else {
             logger.warning("[TELEPHONE] Cannot answer: state=\(String(describing: self.callState))")
             return
         }
 
         cancelTimers()
+        onDiagnostic?("[TEL] answer(): sending CONNECTING, profile=\(String(describing: activeProfile?.displayName))")
         transitionState(to: .connecting)
         await sendSignal(.connecting, on: link)
 
         await startAudioPipeline()
+        onDiagnostic?("[TEL] answer(): pipeline started, linkSource=\(linkSource != nil), codec=\(String(describing: codec?.codecType))")
 
         transitionState(to: .established)
         await sendSignal(.established, on: link)
+        onDiagnostic?("[TEL] answer(): sent ESTABLISHED, calling establishedCallback")
         logger.info("[TELEPHONE] Call ESTABLISHED (incoming)")
 
         if let remote = remoteIdentity {
             await establishedCallback?(remote)
+            onDiagnostic?("[TEL] answer(): establishedCallback done")
         }
     }
 
@@ -291,6 +330,7 @@ public actor Telephone {
     /// Python `hangup()`: If ringing and incoming, send REJECTED. Teardown link.
     public func hangup() async {
         guard let link = activeCall else { return }
+        onDiagnostic?("[TEL] hangup(): callState=\(String(describing: callState)), frames=\(receivedFrameCount)")
 
         cancelTimers()
         await stopAudioPipeline()
@@ -385,8 +425,12 @@ public actor Telephone {
     /// Python `signalling_received()`: Dispatch signals.
     private func handlePacket(data: Data, packet: Packet) async {
         let first4 = data.prefix(4).map { String(format: "%02x", $0) }.joined()
+        if receivedFrameCount == 0 {
+            onDiagnostic?("[TEL] handlePacket first: \(data.count) bytes, first4=\(first4)")
+        }
         logger.error("[TELEPHONE] handlePacket: \(data.count, privacy: .public) bytes, first4=\(first4, privacy: .public)")
         guard let parsed = try? LXSTWireFormat.unpack(data) else {
+            onDiagnostic?("[TEL] unpack FAILED: \(data.count) bytes, first4=\(first4)")
             logger.error("[TELEPHONE] unpack FAILED for \(data.count, privacy: .public) bytes, first4=\(first4, privacy: .public)")
             return
         }
@@ -413,7 +457,8 @@ public actor Telephone {
     /// (Android's Chaquopy bridge doesn't reliably deliver those signals).
     private func routeAudioFrame(data: Data, packet: Packet) async {
         receivedFrameCount += 1
-        if receivedFrameCount == 1 || receivedFrameCount % 50 == 0 {
+        if receivedFrameCount == 1 || receivedFrameCount % 100 == 0 {
+            onDiagnostic?("[TEL] audioFrame #\(receivedFrameCount): \(data.count)B, linkSource=\(linkSource != nil)")
             logger.error("[TELEPHONE] Received audio frame #\(self.receivedFrameCount, privacy: .public), bytes=\(data.count, privacy: .public)")
         }
         if linkSource == nil {
@@ -445,6 +490,7 @@ public actor Telephone {
         // Check for preferred profile signal (>= 0xFF)
         if let profile = LXSTWireFormat.extractPreferredProfile(from: signal) {
             activeProfile = profile
+            onDiagnostic?("[TEL] PREFERRED_PROFILE: \(profile.displayName)")
             logger.error("[TELEPHONE] Remote preferred profile: \(profile.displayName, privacy: .public)")
             await profileNegotiatedCallback?(profile)
             return
@@ -454,6 +500,7 @@ public actor Telephone {
 
         switch signalCode {
         case .busy:
+            onDiagnostic?("[TEL] signal: BUSY")
             logger.error("[TELEPHONE] Remote is BUSY")
             cancelTimers()
             let remote = remoteIdentity
@@ -464,6 +511,7 @@ public actor Telephone {
             transitionState(to: .idle)
 
         case .rejected:
+            onDiagnostic?("[TEL] signal: REJECTED")
             logger.error("[TELEPHONE] Remote REJECTED call")
             cancelTimers()
             let remote = remoteIdentity
@@ -486,7 +534,9 @@ public actor Telephone {
             if let profile = activeProfile {
                 await sendPreferredProfile(profile, on: link)
             }
-            await ringingCallback?(identity)
+            if let remote = remoteIdentity {
+                await ringingCallback?(remote)
+            }
 
         case .connecting:
             // Callee answered, setting up pipelines
@@ -529,7 +579,9 @@ public actor Telephone {
     ///
     /// Python: `RNS.Packet(link, data).send()`
     /// This creates an encrypted link DATA packet and sends it.
+    private var sendDataCount: Int = 0
     private func sendData(_ data: Data, on link: Link) async {
+        sendDataCount += 1
         do {
             let encrypted = try await link.encrypt(data)
             let header = PacketHeader(
@@ -548,7 +600,11 @@ public actor Telephone {
                 data: encrypted
             )
             try await transport.send(packet: packet)
+            if sendDataCount <= 3 || sendDataCount % 50 == 0 {
+                onDiagnostic?("[TEL] sendData #\(sendDataCount): \(data.count)B raw, \(encrypted.count)B enc")
+            }
         } catch {
+            onDiagnostic?("[TEL] sendData FAILED #\(sendDataCount): \(error)")
             logger.error("[TELEPHONE] Failed to send data: \(error)")
         }
     }
@@ -558,6 +614,7 @@ public actor Telephone {
     /// Handle link closure (remote hangup or network failure).
     func handleLinkClosed(reason: TeardownReason) async {
         guard activeCall != nil else { return }
+        onDiagnostic?("[TEL] handleLinkClosed: reason=\(reason), callState=\(String(describing: callState)), frames=\(receivedFrameCount)")
 
         cancelTimers()
         await stopAudioPipeline()
@@ -664,6 +721,7 @@ public actor Telephone {
         remoteIdentity = nil
         isIncoming = false
         activeProfile = nil
+        pendingAnswer = false
         sentFrameCount = 0
         receivedFrameCount = 0
     }
