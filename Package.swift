@@ -14,7 +14,7 @@ let package = Package(
         )
     ],
     dependencies: [
-        .package(path: "../ReticulumSwift"),
+        .package(url: "git@github.com:torlando-tech/reticulum-swift-lib.git", from: "0.1.0"),
     ],
     targets: [
         // Opus codec compiled from source (v1.5.2)
@@ -90,7 +90,7 @@ let package = Package(
         .target(
             name: "LXSTSwift",
             dependencies: [
-                "ReticulumSwift",
+                .product(name: "ReticulumSwift", package: "reticulum-swift-lib"),
                 "COpus",
                 "CCodec2",
             ],
