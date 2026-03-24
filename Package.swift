@@ -20,7 +20,7 @@ let package = Package(
         )
     ],
     dependencies: [
-        .package(url: "git@github.com:torlando-tech/reticulum-swift-lib.git", from: "0.1.0"),
+        .package(url: "https://github.com/torlando-tech/reticulum-swift-lib.git", from: "0.1.0"),
     ],
     targets: [
         // Opus codec compiled from source (v1.5.2)
