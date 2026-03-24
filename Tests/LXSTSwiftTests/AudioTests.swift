@@ -14,6 +14,12 @@
 import XCTest
 @testable import LXSTSwift
 
+private func peakMagnitude<S: Sequence>(_ samples: S) -> Int where S.Element == Int16 {
+    samples.reduce(0) { current, sample in
+        max(current, abs(Int(sample)))
+    }
+}
+
 final class ResamplerTests: XCTestCase {
 
     func testIdentityResample() {
@@ -554,7 +560,7 @@ final class OpusRoundTripTests: XCTestCase {
                 pcm[i * profile.channels + c] = sample
             }
         }
-        let inputPeak = pcm.reduce(Int16(0)) { Swift.max($0, abs($1)) }
+        let inputPeak = peakMagnitude(pcm)
         print("Input peak: \(inputPeak)")
 
         // Encode
@@ -564,7 +570,7 @@ final class OpusRoundTripTests: XCTestCase {
 
         // Decode
         let decoded = try codec.decode(encoded)
-        let outputPeak = decoded.reduce(Int16(0)) { Swift.max($0, abs($1)) }
+        let outputPeak = peakMagnitude(decoded)
         print("Decoded: \(decoded.count) samples, peak=\(outputPeak)")
 
         XCTAssertEqual(decoded.count, totalSamples)
@@ -594,7 +600,7 @@ final class OpusRoundTripTests: XCTestCase {
 
         do {
             let decoded = try stereoCodec.decode(monoEncoded)
-            let peak = decoded.reduce(Int16(0)) { Swift.max($0, abs($1)) }
+            let peak = peakMagnitude(decoded)
             print("Stereo decode of mono data: \(decoded.count) samples, peak=\(peak)")
             // If this succeeds, it means Opus CAN decode mono with stereo decoder
             // Check if peak is near-zero (would explain our bug!)
@@ -740,7 +746,7 @@ final class OpusStereoInteropTests: XCTestCase {
         }
 
         XCTAssertEqual(decoded, 960, "Should decode 960 samples per channel (20ms)")
-        let peak = pcm.prefix(Int(decoded) * 2).reduce(Int16(0)) { Swift.max($0, abs($1)) }
+        let peak = peakMagnitude(pcm.prefix(Int(decoded) * 2))
         XCTAssertGreaterThan(peak, 1000, "Hybrid 20ms decode peak=\(peak) — should contain audible 440Hz tone")
     }
 
@@ -769,7 +775,7 @@ final class OpusStereoInteropTests: XCTestCase {
         }
 
         XCTAssertEqual(decoded, 2880, "Should decode 2880 samples per channel (60ms)")
-        let peak = pcm.prefix(Int(decoded) * 2).reduce(Int16(0)) { Swift.max($0, abs($1)) }
+        let peak = peakMagnitude(pcm.prefix(Int(decoded) * 2))
         XCTAssertGreaterThan(peak, 1000, "Hybrid 60ms decode peak=\(peak) — should contain audible 440Hz tone")
     }
 
@@ -792,7 +798,7 @@ final class OpusStereoInteropTests: XCTestCase {
         let config = Int(tocByte) >> 3
 
         let decoded = try codec.decode(encoded)
-        let peak = decoded.reduce(Int16(0)) { Swift.max($0, abs($1)) }
+        let peak = peakMagnitude(decoded)
 
         XCTAssertGreaterThan(peak, 1000, "Roundtrip peak=\(peak) TOC=0x\(String(format: "%02x", tocByte)) config=\(config) — should be substantial")
     }
@@ -808,7 +814,7 @@ final class OpusStereoInteropTests: XCTestCase {
 
         let codec = try OpusCodec(profile: .voiceMax) // 48kHz stereo VOIP 32kbps
         let decoded = try codec.decode(data)
-        let peak = decoded.reduce(Int16(0)) { Swift.max($0, abs($1)) }
+        let peak = peakMagnitude(decoded)
 
         print("Cross-platform SILK decode: \(data.count)B → \(decoded.count) samples, peak=\(peak)")
         XCTAssertEqual(decoded.count, 2880 * 2, "Should decode 2880 stereo samples (60ms)")
@@ -855,7 +861,7 @@ final class OpusStereoInteropTests: XCTestCase {
             let stereo = (Int(toc) >> 2) & 1
 
             let decoded = try codec.decode(data)
-            let peak = decoded.reduce(Int16(0)) { Swift.max($0, abs($1)) }
+            let peak = peakMagnitude(decoded)
 
             print("SHQ Frame \(i): \(data.count)B TOC=0x\(String(format: "%02x", toc)) config=\(config) \(stereo == 1 ? "stereo" : "mono") → \(decoded.count) samples, peak=\(peak)")
 
@@ -914,7 +920,7 @@ final class OpusStereoInteropTests: XCTestCase {
         let decodedSamples = opus_decode(decoder, outBuf, encLen, &decodedPcm, Int32(spf), 0)
         XCTAssertEqual(decodedSamples, Int32(spf))
 
-        let peak = decodedPcm.prefix(Int(decodedSamples) * 2).reduce(Int16(0)) { Swift.max($0, abs($1)) }
+        let peak = peakMagnitude(decodedPcm.prefix(Int(decodedSamples) * 2))
         let isHybrid = config >= 12 && config <= 15
         XCTAssertTrue(isHybrid, "Expected Hybrid mode (config 12-15), got config=\(config) TOC=0x\(String(format: "%02x", tocByte))")
         XCTAssertGreaterThan(peak, 100, "Hybrid decode peak=\(peak) TOC=0x\(String(format: "%02x", tocByte)) config=\(config) — near-zero means SILK/Hybrid broken")

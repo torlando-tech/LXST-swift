@@ -17,6 +17,12 @@ import os.log
 
 private let opusLogger = Logger(subsystem: "com.lxst.swift", category: "OpusCodec")
 
+private func opusPeakMagnitude<S: Sequence>(_ samples: S) -> Int where S.Element == Int16 {
+    samples.reduce(0) { current, sample in
+        max(current, abs(Int(sample)))
+    }
+}
+
 #if canImport(COpus)
 import COpus
 
@@ -152,7 +158,7 @@ public final class OpusCodec: AudioCodec, @unchecked Sendable {
                 pcm[i * channels + c] = sample
             }
         }
-        let inputPeak = pcm.reduce(Int16(0)) { Swift.max($0, abs($1)) }
+        let inputPeak = opusPeakMagnitude(pcm)
 
         do {
             let encoded = try encode(pcm)
@@ -171,7 +177,7 @@ public final class OpusCodec: AudioCodec, @unchecked Sendable {
                 return opus_decode(testDec, bytes.baseAddress, Int32(encoded.count),
                                   &testPcm, Int32(maxFrameSize), 0)
             }
-            let outputPeak = testPcm.prefix(Int(result) * channels).reduce(Int16(0)) { Swift.max($0, abs($1)) }
+            let outputPeak = opusPeakMagnitude(testPcm.prefix(Int(result) * channels))
             let tocByte = encoded.first.map { String(format: "0x%02x", $0) } ?? "nil"
             let msg = "ST: in=\(inputPeak) enc=\(encoded.count)B dec=\(result)samp peak=\(outputPeak) toc=\(tocByte)"
             OpusCodec.lastSelfTestResult = msg
@@ -205,9 +211,11 @@ public final class OpusCodec: AudioCodec, @unchecked Sendable {
         let result = Array(pcmBuffer.prefix(Int(decodedSamples) * channels))
 
         // Log raw input bytes and decoded int16 peak
-        let peakInt16 = result.reduce(Int16(0)) { Swift.max($0, abs($1)) }
+        let peakInt16 = opusPeakMagnitude(result)
         OpusCodec.totalDecodes = decodeCount
-        if peakInt16 > OpusCodec.maxPeakInt16 { OpusCodec.maxPeakInt16 = peakInt16 }
+        if peakInt16 > Int(OpusCodec.maxPeakInt16) {
+            OpusCodec.maxPeakInt16 = Int16(clamping: peakInt16)
+        }
         if decodeCount <= 20 || decodeCount % 50 == 0 {
             let first8 = data.prefix(8).map { String(format: "%02x", $0) }.joined(separator: " ")
             OpusCodec.lastDecodeInfo = "D#\(decodeCount) in=\(data.count)B pk=\(peakInt16) maxPk=\(OpusCodec.maxPeakInt16) [\(first8)]"
