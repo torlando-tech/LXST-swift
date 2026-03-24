@@ -1,10 +1,10 @@
+// swift-tools-version: 5.9
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 //
 // Copyright (c) 2026 Torlando Tech LLC
-//
-// swift-tools-version: 5.9
+
 import PackageDescription
 
 let package = Package(
@@ -20,7 +20,7 @@ let package = Package(
         )
     ],
     dependencies: [
-        .package(url: "https://github.com/torlando-tech/reticulum-swift-lib.git", from: "0.1.0"),
+        .package(path: "../reticulum-swift-lib"),
     ],
     targets: [
         // Opus codec compiled from source (v1.5.2)
