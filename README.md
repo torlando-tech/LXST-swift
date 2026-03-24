@@ -27,4 +27,6 @@ dependencies: [
 - [Reticulum](https://reticulum.network), [LXMF](https://github.com/markqvist/LXMF) and [LXST](https://github.com/markqvist/LXST) by Mark Qvist
 ## License
 
-[MPL-2.0](LICENSE)
+Copyright (c) 2026 Torlando Tech LLC.
+
+Licensed under the [Mozilla Public License 2.0](LICENSE).
