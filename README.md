@@ -2,8 +2,6 @@
 
 A Swift implementation of LXST (Lightweight Extensible Streaming Transport) for real-time voice calls over [Reticulum](https://reticulum.network) networks.
 
-Copyright (c) 2026 Torlando Tech LLC
-
 ## Requirements
 
 - Swift 5.9+
