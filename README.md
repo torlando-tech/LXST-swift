@@ -23,7 +23,7 @@ dependencies: [
 - **Codec** — Opus and Codec2 voice encoding compiled from source (no external binary dependencies)
 
 ## Acknowledgements
-- This work was partially funded by the [Solarkpunk Pioneers Fund](https://solarpunk-pioneers.org)
+- This work was partially funded by the [Solarpunk Pioneers Fund](https://solarpunk-pioneers.org)
 - K8 and 405nm for generously donating for an iPhone
 - [Reticulum](https://reticulum.network), [LXMF](https://github.com/markqvist/LXMF) and [LXST](https://github.com/markqvist/LXST) by Mark Qvist
 ## License
