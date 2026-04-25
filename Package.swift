@@ -20,7 +20,13 @@ let package = Package(
         )
     ],
     dependencies: [
-        .package(url: "https://github.com/torlando-tech/reticulum-swift.git", branch: "main"),
+        // Pinned to a semver constraint rather than `branch: "main"`.
+        // Tracking a branch makes resolution non-reproducible: every
+        // fresh checkout pulls whatever main HEAD happens to be, and
+        // downstream consumers (Columba-iOS) inherit that drift
+        // transitively. `from:` lets SPM pick the latest semver
+        // release while keeping each build pinned.
+        .package(url: "https://github.com/torlando-tech/reticulum-swift.git", from: "0.1.0"),
     ],
     targets: [
         // Opus codec compiled from source (v1.5.2)
