@@ -26,7 +26,7 @@ let package = Package(
         // downstream consumers (Columba-iOS) inherit that drift
         // transitively. `from:` lets SPM pick the latest semver
         // release while keeping each build pinned.
-        .package(url: "https://github.com/torlando-tech/reticulum-swift.git", from: "0.1.0"),
+        .package(url: "https://github.com/torlando-tech/reticulum-swift.git", from: "0.2.0"),
     ],
     targets: [
         // Opus codec compiled from source (v1.5.2)
