@@ -14,30 +14,25 @@
 
 import Foundation
 
-/// Packetizer sends encoded audio frames over a Reticulum link.
+/// Packetizer wraps encoded audio frames with their codec header and hands the
+/// LXST-wire payload to a send callback. Transport-agnostic: encryption and
+/// link transmission are the `NetworkTransport`'s job, not the packetizer's.
 ///
-/// Python `Packetizer` (Network.py:49) wraps audio frames with codec headers
-/// and sends them as `RNS.Packet(link, msgpack({FIELD_FRAMES: header+frame}))`.
+/// Mirrors Python `Packetizer` (Network.py:49), minus the RNS link — the wire
+/// payload `{FIELD_FRAMES: codec_header + frame}` is produced by
+/// `LXSTWireFormat.packFrame` and passed on for the transport to send.
 public actor Packetizer {
 
-    /// The link to send frames on.
-    private weak var link: Link?
-
-    /// Send callback for transmitting packet data.
-    private var sendCallback: (@Sendable (Data) async throws -> Void)?
+    /// Send callback for transmitting the packed LXST payload.
+    private var sendCallback: (@Sendable (Data) async -> Void)?
 
     /// Whether the packetizer is active.
     public private(set) var isRunning: Bool = false
 
-    /// Create a packetizer for a link.
-    ///
-    /// - Parameter link: The link to send audio over
-    public init(link: Link) {
-        self.link = link
-    }
+    public init() {}
 
-    /// Set the send callback for packet transmission.
-    public func setSendCallback(_ callback: @escaping @Sendable (Data) async throws -> Void) {
+    /// Set the send callback for packed-payload transmission.
+    public func setSendCallback(_ callback: @escaping @Sendable (Data) async -> Void) {
         self.sendCallback = callback
     }
 
@@ -51,25 +46,14 @@ public actor Packetizer {
         isRunning = false
     }
 
-    /// Send an encoded audio frame.
-    ///
-    /// Wraps the frame with codec header and sends as msgpack DATA packet.
-    /// Python: `frame = codec_header_byte(type(self.source.codec)) + frame`
-    ///         `packet_data = {FIELD_FRAMES: frame}`
+    /// Pack an encoded audio frame with its codec header and emit it.
     ///
     /// - Parameters:
     ///   - codecType: The codec type for the header byte
     ///   - encodedAudio: The encoded audio data
-    public func sendFrame(codecType: LXSTCodecType, encodedAudio: Data) async throws {
+    public func sendFrame(codecType: LXSTCodecType, encodedAudio: Data) async {
         guard isRunning else { return }
-        guard let link = link else { return }
-
         let packetData = LXSTWireFormat.packFrame(codecType: codecType, encodedAudio: encodedAudio)
-
-        // Encrypt and send as link DATA packet
-        let encrypted = try await link.encrypt(packetData)
-        if let send = sendCallback {
-            try await send(encrypted)
-        }
+        await sendCallback?(packetData)
     }
 }

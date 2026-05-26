@@ -20,13 +20,11 @@ let package = Package(
         )
     ],
     dependencies: [
-        // Pinned to a semver constraint rather than `branch: "main"`.
-        // Tracking a branch makes resolution non-reproducible: every
-        // fresh checkout pulls whatever main HEAD happens to be, and
-        // downstream consumers (Columba-iOS) inherit that drift
-        // transitively. `from:` lets SPM pick the latest semver
-        // release while keeping each build pinned.
-        .package(url: "https://github.com/torlando-tech/reticulum-swift.git", from: "0.2.0"),
+        // No external dependencies. LXSTSwift is transport-agnostic: the
+        // network layer is injected by the host app via the `NetworkTransport`
+        // protocol, so there is no Reticulum-stack dependency. (Previously
+        // depended on reticulum-swift; that coupling now lives entirely behind
+        // NetworkTransport, and the host provides the implementation.)
     ],
     targets: [
         // Opus codec compiled from source (v1.5.2)
@@ -102,7 +100,6 @@ let package = Package(
         .target(
             name: "LXSTSwift",
             dependencies: [
-                .product(name: "ReticulumSwift", package: "reticulum-swift"),
                 "COpus",
                 "CCodec2",
             ],

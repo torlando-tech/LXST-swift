@@ -4,4 +4,10 @@
 //
 // Copyright (c) 2026 Torlando Tech LLC
 //
-@_exported import ReticulumSwift
+// LXSTSwift is transport-agnostic: it owns the call state machine, LXST wire
+// format, codecs, and audio pipeline, and reaches the network only through the
+// `NetworkTransport` protocol (implemented by the host app). It has no
+// dependency on any Reticulum stack — the host injects the transport. (Was
+// `@_exported import ReticulumSwift`; the RNS coupling now lives entirely
+// behind NetworkTransport.)
+import Foundation

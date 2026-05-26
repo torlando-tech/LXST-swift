@@ -67,10 +67,8 @@ public actor LinkSource {
     /// Android batch formats `{0x01: [f1, f2, f3]}` where each element
     /// is bytes(codec_type + opus_data).
     ///
-    /// - Parameters:
-    ///   - data: Decrypted packet data
-    ///   - packet: The original packet
-    public func handlePacket(data: Data, packet: Packet) async {
+    /// - Parameter data: Decrypted LXST-wire payload (msgpack map).
+    public func handlePacket(data: Data) async {
         guard isRunning else { return }
 
         guard let value = try? unpackMsgPack(data),

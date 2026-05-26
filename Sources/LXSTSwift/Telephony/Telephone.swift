@@ -9,7 +9,12 @@
 //  LXSTSwift
 //
 //  Main telephony actor matching Python LXST Primitives/Telephony.py.
-//  Manages call signaling over Reticulum Links.
+//  Owns the call STATE MACHINE and SIGNALLING; reaches the network only
+//  through `NetworkTransport`. All link lifecycle, encryption, packetization,
+//  identify, path resolution, and incoming-link detection live in the host
+//  app's transport implementation — no Reticulum types appear here. Peers are
+//  `Data` hashes, signals are `Int`, payloads are `Data` (packed by
+//  `LXSTWireFormat`). Mirrors LXST-kt's `Telephone` + `NetworkTransport`.
 //
 
 import Foundation
@@ -17,31 +22,26 @@ import os.log
 
 private let logger = Logger(subsystem: "com.lxst.swift", category: "Telephone")
 
-/// Telephony actor for LXST voice calls over Reticulum links.
+/// Telephony actor for LXST voice calls.
 ///
-/// Manages the full call lifecycle: destination registration, incoming/outgoing
-/// call setup, signal exchange, and teardown. Audio pipelines are stubbed —
-/// this actor handles only signaling.
-///
-/// Matches Python `Telephone` class in `Primitives/Telephony.py`.
+/// Manages the full call lifecycle: incoming/outgoing call setup, signal
+/// exchange, and teardown, plus the audio pipeline. The network is abstracted
+/// behind `NetworkTransport`, which the host app injects.
 public actor Telephone {
 
-    // MARK: - Properties
+    // MARK: - Dependencies
 
-    /// Local identity for this telephone endpoint.
-    public let identity: Identity
+    /// Network transport (host-provided). Owns identity, destination
+    /// registration, link lifecycle, encryption, and packetization.
+    private let transport: any NetworkTransport
 
-    /// Transport instance for sending/receiving packets.
-    private let transport: ReticulumTransport
-
-    /// RNS destination for incoming calls: (identity, IN, SINGLE, "lxst", "telephony").
-    public let destination: Destination
+    // MARK: - Call State
 
     /// Current call state.
     public private(set) var callState: CallState = .idle
 
-    /// Active call link (nil when idle).
-    private var activeCall: Link?
+    /// Whether a call link is currently active (mirrors the transport's link).
+    private var inCall: Bool = false
 
     /// Whether this is an incoming or outgoing call.
     private var isIncoming: Bool = false
@@ -49,8 +49,8 @@ public actor Telephone {
     /// Active telephony profile for the current call.
     private var activeProfile: TelephonyProfile?
 
-    /// Remote peer's identity (after identification).
-    private var remoteIdentity: Identity?
+    /// Remote peer's identity hash (after identification, or the dialled hash).
+    private var remoteIdentityHash: Data?
 
     // MARK: - Audio Pipeline
 
@@ -91,79 +91,78 @@ public actor Telephone {
 
     // MARK: - Callbacks
 
-    /// Called when an incoming call starts ringing.
-    private var ringingCallback: (@Sendable (Identity) async -> Void)?
+    /// Called when an incoming call starts ringing. Carries the caller's identity hash.
+    private var ringingCallback: (@Sendable (Data) async -> Void)?
 
-    /// Called when a call is established.
-    private var establishedCallback: (@Sendable (Identity) async -> Void)?
+    /// Called when a call is established. Carries the remote identity hash.
+    private var establishedCallback: (@Sendable (Data) async -> Void)?
 
-    /// Called when a call ends.
-    private var endedCallback: (@Sendable (Identity?, CallEndReason) async -> Void)?
+    /// Called when a call ends. Carries the remote identity hash (if known) + reason.
+    private var endedCallback: (@Sendable (Data?, CallEndReason) async -> Void)?
 
     /// Diagnostic logging callback (set by app layer).
     public var onDiagnostic: (@Sendable (String) -> Void)?
 
     // MARK: - Timers
 
-    /// Ring timeout task.
     private var ringTimeoutTask: Task<Void, Never>?
-
-    /// Connect timeout task.
     private var connectTimeoutTask: Task<Void, Never>?
 
     /// If true, answer() was called before the Telephone reached .ringing state.
-    /// handleCallerIdentified will auto-answer when it transitions to .ringing.
     private var pendingAnswer: Bool = false
 
     // MARK: - Initialization
 
-    /// Create a new Telephone endpoint.
+    /// Create a new Telephone endpoint over the given transport.
     ///
-    /// Registers an RNS destination `(identity, IN, SINGLE, "lxst", "telephony")`
-    /// for incoming calls and sets up the link established callback.
-    ///
-    /// - Parameters:
-    ///   - identity: Local identity for this endpoint
-    ///   - transport: Transport for sending/receiving
-    public init(identity: Identity, transport: ReticulumTransport) async {
-        self.identity = identity
+    /// The transport owns the local identity + telephony-destination
+    /// registration; `Telephone` wires its inbound handlers and drives
+    /// signalling. Construct via `Telephone.make(transport:)` so handler setup
+    /// (which is async) completes before use.
+    public init(transport: any NetworkTransport) {
         self.transport = transport
+    }
 
-        // Create destination matching Python: Destination(identity, IN, SINGLE, APP_NAME, PRIMITIVE_NAME)
-        self.destination = Destination(
-            identity: identity,
-            appName: TelephonyConstants.appName,
-            aspects: [TelephonyConstants.primitiveName],
-            type: .single,
-            direction: .in
-        )
+    /// Create and fully wire a Telephone (registers inbound handlers on the
+    /// transport). Prefer this over the bare initializer.
+    public static func make(transport: any NetworkTransport) async -> Telephone {
+        let phone = Telephone(transport: transport)
+        await phone.installTransportHandlers()
+        return phone
+    }
 
-        // Register destination with transport for incoming links
-        await transport.registerDestination(destination)
-
-        let destHex = self.destination.hash.prefix(8).map { String(format: "%02x", $0) }.joined()
-        logger.error("[TELEPHONE] Listening on \(destHex, privacy: .public)")
+    /// Wire the transport's inbound handlers to this actor. Idempotent.
+    public func installTransportHandlers() async {
+        await transport.setIncomingCallHandler { [weak self] in
+            await self?.handleIncomingCall()
+        }
+        await transport.setRemoteIdentifiedHandler { [weak self] hash in
+            await self?.handleCallerIdentified(hash)
+        }
+        await transport.setReceiveHandler { [weak self] data in
+            await self?.handlePacket(data: data)
+        }
+        await transport.setClosedHandler { [weak self] reason in
+            await self?.handleLinkClosed(reason: reason)
+        }
+        logger.error("[TELEPHONE] Transport handlers installed")
     }
 
     // MARK: - Callback Setters
 
-    public func setRingingCallback(_ callback: @escaping @Sendable (Identity) async -> Void) {
+    public func setRingingCallback(_ callback: @escaping @Sendable (Data) async -> Void) {
         self.ringingCallback = callback
     }
 
-    public func setEstablishedCallback(_ callback: @escaping @Sendable (Identity) async -> Void) {
+    public func setEstablishedCallback(_ callback: @escaping @Sendable (Data) async -> Void) {
         self.establishedCallback = callback
     }
 
-    public func setEndedCallback(_ callback: @escaping @Sendable (Identity?, CallEndReason) async -> Void) {
+    public func setEndedCallback(_ callback: @escaping @Sendable (Data?, CallEndReason) async -> Void) {
         self.endedCallback = callback
     }
 
     /// Set callback fired when the remote sends a preferred profile signal.
-    ///
-    /// Called as soon as the remote's profile is known, before the call is established.
-    /// Use this to configure the local audio pipeline (AudioManager) with the right
-    /// codec parameters before `establishedCallback` fires.
     public func setProfileNegotiatedCallback(
         _ callback: (@Sendable (TelephonyProfile) async -> Void)?
     ) {
@@ -171,11 +170,6 @@ public actor Telephone {
     }
 
     /// Set callback for receiving decoded PCM audio frames from the remote peer.
-    ///
-    /// Called by CallManager to receive audio for playback. Parameters:
-    /// - samples: Float32 PCM samples (-1.0 to 1.0)
-    /// - sampleRate: Sample rate in Hz
-    /// - channels: Number of audio channels
     public func setDecodedAudioCallback(
         _ callback: @escaping @Sendable ([Float], Int, Int) async -> Void
     ) {
@@ -187,22 +181,16 @@ public actor Telephone {
         self.onDiagnostic = callback
     }
 
-    // MARK: - Audio Frame Send/Receive
+    // MARK: - Audio Frame Send
 
     /// Send captured audio samples to the remote peer.
-    ///
-    /// Encodes the samples with the active codec and sends over the link.
-    /// Called by CallManager with mic-captured PCM float samples.
-    ///
-    /// - Parameter samples: Float32 PCM samples from the microphone
     public func sendAudioFrame(_ samples: [Float]) async {
         guard callState == .established,
-              activeCall != nil,
+              inCall,
               let pipeline = audioPipeline,
               let codec = codec else {
-            // Log why we're dropping the frame (first few only)
             if sentFrameCount == 0 {
-                onDiagnostic?("[TEL] sendAudioFrame DROPPED: state=\(String(describing: callState)), link=\(activeCall != nil), pipeline=\(audioPipeline != nil), codec=\(codec != nil)")
+                onDiagnostic?("[TEL] sendAudioFrame DROPPED: state=\(String(describing: callState)), inCall=\(inCall), pipeline=\(audioPipeline != nil), codec=\(codec != nil)")
             }
             return
         }
@@ -210,75 +198,47 @@ public actor Telephone {
         sentFrameCount += 1
         if sentFrameCount == 1 || sentFrameCount % 50 == 0 {
             onDiagnostic?("[TEL] TX frame #\(sentFrameCount): \(samples.count) samples")
-            logger.error("[TELEPHONE] Sending frame #\(self.sentFrameCount, privacy: .public), samples=\(samples.count, privacy: .public)")
         }
         await pipeline.processCapture(samples, codec: codec)
     }
 
     // MARK: - Incoming Call Handling
 
-    /// Handle an incoming link established event.
-    ///
-    /// Python `__incoming_link_established`: If busy, send BUSY and teardown.
-    /// Otherwise, send AVAILABLE and wait for identification.
-    ///
-    /// - Parameter link: The newly established incoming link
-    public func handleIncomingLink(_ link: Link) async {
-        // Check if already in a call
-        if activeCall != nil || callState != .idle {
+    /// Handle an incoming call link (transport has accepted the link and wired
+    /// its inbound handlers to us). If busy, signal BUSY and tear down;
+    /// otherwise signal AVAILABLE and await identification.
+    private func handleIncomingCall() async {
+        if inCall || callState != .idle {
             logger.error("[TELEPHONE] Incoming call, but line busy — signalling BUSY")
-            await sendSignal(.busy, on: link)
-            await link.close()
+            await sendSignal(.busy)
+            await transport.closeCall()
             return
         }
 
         isIncoming = true
-
-        // Set packet callback for signalling
-        await link.setPacketCallback { [weak self] data, packet in
-            await self?.handlePacket(data: data, packet: packet)
-        }
-
-        // Notify when caller closes the link (remote hangup or network failure)
-        await link.setCloseCallback { [weak self] reason in
-            await self?.handleLinkClosed(reason: reason)
-        }
-
-        // Set identify callback to receive caller identity
-        await link.setIdentifyCallbacks(TelephoneIdentifyHandler(telephone: self))
-
-        // Store link and send AVAILABLE
-        activeCall = link
+        inCall = true
         transitionState(to: .available)
-        await sendSignal(.available, on: link)
+        await sendSignal(.available)
         logger.error("[TELEPHONE] Sent AVAILABLE to incoming link")
     }
 
-    /// Handle caller identification (LINKIDENTIFY received).
-    ///
-    /// Python `__caller_identified`: Check if allowed, send RINGING, start timer.
-    ///
-    /// - Parameters:
-    ///   - link: The link that identified
-    ///   - identity: The caller's verified identity
-    func handleCallerIdentified(_ remoteId: Identity) async {
-        guard let link = activeCall else { return }
+    /// Handle caller identification (transport surfaced the verified caller hash).
+    func handleCallerIdentified(_ remoteHash: Data) async {
+        guard inCall else { return }
 
-        // Check if caller is allowed
-        if !isAllowed(remoteId) {
-            logger.error("[TELEPHONE] Caller \(remoteId.hash.prefix(4).map { String(format: "%02x", $0) }.joined(), privacy: .public) not allowed, BUSY")
-            await sendSignal(.busy, on: link)
-            await link.close()
+        if !isAllowed(remoteHash) {
+            logger.error("[TELEPHONE] Caller not allowed, BUSY")
+            await sendSignal(.busy)
+            await transport.closeCall()
             resetCallState()
             return
         }
 
-        remoteIdentity = remoteId
+        remoteIdentityHash = remoteHash
         transitionState(to: .ringing)
-        await sendSignal(.ringing, on: link)
+        await sendSignal(.ringing)
         logger.error("[TELEPHONE] Sent RINGING")
 
-        // If user already tapped answer before we reached .ringing, auto-answer now
         if pendingAnswer {
             pendingAnswer = false
             logger.error("[TELEPHONE] Pending answer detected, auto-answering")
@@ -286,28 +246,21 @@ public actor Telephone {
             return
         }
 
-        // Notify callback
-        await ringingCallback?(remoteId)
-
-        // Start ring timeout
+        await ringingCallback?(remoteHash)
         startRingTimeout()
     }
 
     // MARK: - Answer / Hangup
 
     /// Answer an incoming ringing call.
-    ///
-    /// Python `answer()`: send CONNECTING, open pipelines, send ESTABLISHED.
     public func answer() async {
-        // If not yet in .ringing (e.g., still waiting for LINKIDENTIFY),
-        // set a flag so handleCallerIdentified will auto-answer.
-        if callState != .ringing && isIncoming && activeCall != nil {
+        if callState != .ringing && isIncoming && inCall {
             logger.error("[TELEPHONE] answer() called in state \(String(describing: self.callState)), deferring until .ringing")
             pendingAnswer = true
             return
         }
 
-        guard callState == .ringing, let link = activeCall, isIncoming else {
+        guard callState == .ringing, inCall, isIncoming else {
             logger.warning("[TELEPHONE] Cannot answer: state=\(String(describing: self.callState))")
             return
         }
@@ -315,47 +268,39 @@ public actor Telephone {
         cancelTimers()
         onDiagnostic?("[TEL] answer(): sending CONNECTING, profile=\(String(describing: activeProfile?.displayName))")
         transitionState(to: .connecting)
-        await sendSignal(.connecting, on: link)
+        await sendSignal(.connecting)
 
         await startAudioPipeline()
         onDiagnostic?("[TEL] answer(): pipeline started, linkSource=\(linkSource != nil), codec=\(String(describing: codec?.codecType))")
 
         transitionState(to: .established)
-        await sendSignal(.established, on: link)
+        await sendSignal(.established)
         onDiagnostic?("[TEL] answer(): sent ESTABLISHED, calling establishedCallback")
         logger.info("[TELEPHONE] Call ESTABLISHED (incoming)")
 
-        if let remote = remoteIdentity {
+        if let remote = remoteIdentityHash {
             await establishedCallback?(remote)
             onDiagnostic?("[TEL] answer(): establishedCallback done")
         }
     }
 
     /// Hang up the active call.
-    ///
-    /// Python `hangup()`: If ringing and incoming, send REJECTED. Teardown link.
     public func hangup() async {
-        guard let link = activeCall else { return }
+        guard inCall else { return }
         onDiagnostic?("[TEL] hangup(): callState=\(String(describing: callState)), frames=\(receivedFrameCount)")
 
         cancelTimers()
         await stopAudioPipeline()
 
-        // If ringing and incoming, send REJECTED
+        // If ringing and incoming, send REJECTED before tearing down.
         if isIncoming && callState == .ringing {
-            await sendSignal(.rejected, on: link)
+            await sendSignal(.rejected)
         }
 
-        // Clear close callback before closing so we don't get a spurious handleLinkClosed
-        await link.setCloseCallback(nil)
-
-        let linkState = await link.state
-        if linkState.isEstablished {
-            await link.close()
-        }
+        await transport.closeCall()
 
         let reason: CallEndReason = .localHangup
-        let remote = remoteIdentity
+        let remote = remoteIdentityHash
         resetCallState()
         transitionState(to: .ended(reason))
         await endedCallback?(remote, reason)
@@ -364,80 +309,49 @@ public actor Telephone {
 
     // MARK: - Outgoing Call
 
-    /// Initiate an outgoing call.
-    ///
-    /// Python `call()`: Create link, wait for AVAILABLE, identify, negotiate.
+    /// Initiate an outgoing call to a peer's telephony destination hash.
     ///
     /// - Parameters:
-    ///   - remoteIdentity: Identity of the person to call
-    ///   - profile: Preferred telephony profile (default: QUALITY_MEDIUM)
-    public func call(remoteIdentity: Identity, profile: TelephonyProfile = .qualityMedium) async throws {
-        guard callState == .idle, activeCall == nil else {
+    ///   - destinationHash: The peer's lxst.telephony destination hash.
+    ///   - profile: Preferred telephony profile (default: QUALITY_MEDIUM).
+    public func call(destinationHash: Data, profile: TelephonyProfile = .qualityMedium) async throws {
+        guard callState == .idle, !inCall else {
             throw LXSTError.alreadyInCall
         }
 
         isIncoming = false
         activeProfile = profile
-        self.remoteIdentity = remoteIdentity  // Store so establishedCallback fires on ESTABLISHED
+        remoteIdentityHash = destinationHash
         transitionState(to: .calling)
-        logger.error("[TELEPHONE] call() entered, creating destination")
+        logger.error("[TELEPHONE] call() entered")
 
-        // Create outbound destination
-        let callDest = Destination(
-            identity: remoteIdentity,
-            appName: TelephonyConstants.appName,
-            aspects: [TelephonyConstants.primitiveName],
-            type: .single,
-            direction: .out
-        )
-        let destHex = callDest.hash.map { String(format: "%02x", $0) }.joined()
-        logger.error("[TELEPHONE] callDest hash=\(destHex, privacy: .public)")
-
-        // Ensure a path to the telephony destination exists.
-        // If not cached, this sends a PATH REQUEST and waits up to 10s for a response.
-        // Without a path, the relay can't route our LINKREQUEST to the remote peer.
-        logger.error("[TELEPHONE] Awaiting path to telephony destination...")
-        let pathFound = await transport.awaitPath(for: callDest.hash, timeout: 10.0)
-        logger.error("[TELEPHONE] Path found: \(pathFound, privacy: .public)")
-
-        // Use transport.initiateLink() which:
-        //   1. Checks the path (throws noPathAvailable if still missing)
-        //   2. Creates the Link and registers it in pendingLinks
-        //   3. Sends the LINKREQUEST — so LINKPROOF is matched correctly when it arrives
-        let link = try await transport.initiateLink(to: callDest, identity: identity)
-        activeCall = link
-        logger.error("[TELEPHONE] Link initiated, setting packet callback")
-
-        // Set packet callback for DATA signalling packets (arrives after link is established)
-        await link.setPacketCallback { [weak self] data, packet in
-            await self?.handlePacket(data: data, packet: packet)
+        // Transport handles path resolution + link establishment + wiring.
+        let opened = await transport.openOutboundCall(to: destinationHash)
+        guard opened else {
+            logger.error("[TELEPHONE] openOutboundCall failed")
+            resetCallState()
+            transitionState(to: .ended(.connectTimeout))
+            await endedCallback?(destinationHash, .connectTimeout)
+            transitionState(to: .idle)
+            throw LXSTError.callError("Outbound link establishment failed")
         }
+        inCall = true
+        logger.error("[TELEPHONE] Outbound link established")
 
-        // Notify when remote closes the link (remote hangup or network failure)
-        await link.setCloseCallback { [weak self] reason in
-            await self?.handleLinkClosed(reason: reason)
-        }
-
-        // Start connect timeout
+        // Start connect timeout — we now wait for AVAILABLE → identify → RINGING.
         startConnectTimeout()
-
-        logger.error("[TELEPHONE] Outgoing call initiated")
     }
 
     // MARK: - Signal Handling
 
-    /// Handle received packet data on the active call link.
-    ///
-    /// Python `signalling_received()`: Dispatch signals.
-    private func handlePacket(data: Data, packet: Packet) async {
+    /// Handle a received (decrypted) LXST payload from the transport.
+    private func handlePacket(data: Data) async {
         let first4 = data.prefix(4).map { String(format: "%02x", $0) }.joined()
         if receivedFrameCount == 0 {
             onDiagnostic?("[TEL] handlePacket first: \(data.count) bytes, first4=\(first4)")
         }
-        logger.error("[TELEPHONE] handlePacket: \(data.count, privacy: .public) bytes, first4=\(first4, privacy: .public)")
         guard let parsed = try? LXSTWireFormat.unpack(data) else {
             onDiagnostic?("[TEL] unpack FAILED: \(data.count) bytes, first4=\(first4)")
-            logger.error("[TELEPHONE] unpack FAILED for \(data.count, privacy: .public) bytes, first4=\(first4, privacy: .public)")
             return
         }
 
@@ -450,22 +364,17 @@ public actor Telephone {
             for signal in signals {
                 await handleSignal(signal)
             }
-            // Also route the audio frame portion to the pipeline.
-            await routeAudioFrame(data: data, packet: packet)
+            await routeAudioFrame(data: data)
         case .frame:
-            await routeAudioFrame(data: data, packet: packet)
+            await routeAudioFrame(data: data)
         }
     }
 
-    /// Route an audio frame packet to the link source for decoding.
-    ///
-    /// Auto-starts the audio pipeline if CONNECTING/ESTABLISHED were never received
-    /// (Android's Chaquopy bridge doesn't reliably deliver those signals).
-    private func routeAudioFrame(data: Data, packet: Packet) async {
+    /// Route an audio frame payload to the link source for decoding.
+    private func routeAudioFrame(data: Data) async {
         receivedFrameCount += 1
         if receivedFrameCount == 1 || receivedFrameCount % 100 == 0 {
             onDiagnostic?("[TEL] audioFrame #\(receivedFrameCount): \(data.count)B, linkSource=\(linkSource != nil)")
-            logger.error("[TELEPHONE] Received audio frame #\(self.receivedFrameCount, privacy: .public), bytes=\(data.count, privacy: .public)")
         }
         if linkSource == nil {
             guard callState != .idle else {
@@ -476,28 +385,24 @@ public actor Telephone {
             await startAudioPipeline()
             cancelTimers()
             transitionState(to: .established)
-            if let remote = remoteIdentity {
+            if let remote = remoteIdentityHash {
                 await establishedCallback?(remote)
             }
         }
         if let source = linkSource {
-            await source.handlePacket(data: data, packet: packet)
+            await source.handlePacket(data: data)
         } else {
             logger.error("[TELEPHONE] Received audio frame but linkSource still nil after auto-start!")
         }
     }
 
     /// Handle a single signal value.
-    ///
-    /// Python `signalling_received()` lines 683-729.
     private func handleSignal(_ signal: UInt) async {
-        guard let link = activeCall else { return }
+        guard inCall else { return }
 
-        // Check for preferred profile signal (>= 0xFF)
         if let profile = LXSTWireFormat.extractPreferredProfile(from: signal) {
             activeProfile = profile
             onDiagnostic?("[TEL] PREFERRED_PROFILE: \(profile.displayName)")
-            logger.error("[TELEPHONE] Remote preferred profile: \(profile.displayName, privacy: .public)")
             await profileNegotiatedCallback?(profile)
             return
         }
@@ -507,10 +412,9 @@ public actor Telephone {
         switch signalCode {
         case .busy:
             onDiagnostic?("[TEL] signal: BUSY")
-            logger.error("[TELEPHONE] Remote is BUSY")
             cancelTimers()
-            let remote = remoteIdentity
-            await link.close()
+            let remote = remoteIdentityHash
+            await transport.closeCall()
             resetCallState()
             transitionState(to: .ended(.busy))
             await endedCallback?(remote, .busy)
@@ -518,46 +422,42 @@ public actor Telephone {
 
         case .rejected:
             onDiagnostic?("[TEL] signal: REJECTED")
-            logger.error("[TELEPHONE] Remote REJECTED call")
             cancelTimers()
-            let remote = remoteIdentity
-            await link.close()
+            let remote = remoteIdentityHash
+            await transport.closeCall()
             resetCallState()
             transitionState(to: .ended(.rejected))
             await endedCallback?(remote, .rejected)
             transitionState(to: .idle)
 
         case .available:
-            // Callee is available — send identification
+            // Callee is available — identify ourselves over the link.
             logger.error("[TELEPHONE] Remote AVAILABLE, identifying...")
             transitionState(to: .available)
-            try? await link.identify(identity: identity)
+            await transport.identifySelf()
 
         case .ringing:
-            // Callee is ringing — send preferred profile
             logger.error("[TELEPHONE] Remote is RINGING")
             transitionState(to: .ringing)
             if let profile = activeProfile {
-                await sendPreferredProfile(profile, on: link)
+                await sendPreferredProfile(profile)
             }
-            if let remote = remoteIdentity {
+            if let remote = remoteIdentityHash {
                 await ringingCallback?(remote)
             }
 
         case .connecting:
-            // Callee answered, setting up pipelines
             logger.error("[TELEPHONE] Remote CONNECTING")
             transitionState(to: .connecting)
             cancelTimers()
             await startAudioPipeline()
 
         case .established:
-            // Call fully established
             if !isIncoming {
                 logger.error("[TELEPHONE] Call ESTABLISHED (outgoing)")
                 transitionState(to: .established)
                 cancelTimers()
-                if let remote = remoteIdentity {
+                if let remote = remoteIdentityHash {
                     await establishedCallback?(remote)
                 }
             }
@@ -569,63 +469,35 @@ public actor Telephone {
 
     // MARK: - Signal Sending
 
-    /// Send a signal over a link.
-    private func sendSignal(_ signal: LXSTSignal, on link: Link) async {
-        let data = LXSTWireFormat.packSignal(signal)
-        await sendData(data, on: link)
+    private func sendSignal(_ signal: LXSTSignal) async {
+        await send(LXSTWireFormat.packSignal(signal))
     }
 
-    /// Send a preferred profile signal.
-    private func sendPreferredProfile(_ profile: TelephonyProfile, on link: Link) async {
-        let data = LXSTWireFormat.packPreferredProfile(profile)
-        await sendData(data, on: link)
+    private func sendPreferredProfile(_ profile: TelephonyProfile) async {
+        await send(LXSTWireFormat.packPreferredProfile(profile))
     }
 
-    /// Send raw data as a link DATA packet (context 0x00).
-    ///
-    /// Python: `RNS.Packet(link, data).send()`
-    /// This creates an encrypted link DATA packet and sends it.
+    /// Send an LXST-wire payload over the transport (which encrypts + packetizes).
     private var sendDataCount: Int = 0
-    private func sendData(_ data: Data, on link: Link) async {
+    private func send(_ data: Data) async {
         sendDataCount += 1
-        do {
-            let encrypted = try await link.encrypt(data)
-            let header = PacketHeader(
-                headerType: .header1,
-                hasContext: true,
-                transportType: .broadcast,
-                destinationType: .link,
-                packetType: .data,
-                hopCount: 0
-            )
-            let linkId = await link.linkId
-            let packet = Packet(
-                header: header,
-                destination: linkId,
-                context: 0x00, // Regular DATA
-                data: encrypted
-            )
-            try await transport.send(packet: packet)
-            if sendDataCount <= 3 || sendDataCount % 50 == 0 {
-                onDiagnostic?("[TEL] sendData #\(sendDataCount): \(data.count)B raw, \(encrypted.count)B enc")
-            }
-        } catch {
-            onDiagnostic?("[TEL] sendData FAILED #\(sendDataCount): \(error)")
-            logger.error("[TELEPHONE] Failed to send data: \(error)")
+        await transport.send(data)
+        if sendDataCount <= 3 || sendDataCount % 50 == 0 {
+            onDiagnostic?("[TEL] send #\(sendDataCount): \(data.count)B")
         }
     }
 
     // MARK: - Link Closed Handler
 
-    /// Handle link closure (remote hangup or network failure).
-    func handleLinkClosed(reason: TeardownReason) async {
-        guard activeCall != nil else { return }
+    /// Handle link closure surfaced by the transport (remote hangup / failure).
+    func handleLinkClosed(reason: TransportCloseReason) async {
+        guard inCall else { return }
         onDiagnostic?("[TEL] handleLinkClosed: reason=\(reason), callState=\(String(describing: callState)), frames=\(receivedFrameCount)")
 
         cancelTimers()
         await stopAudioPipeline()
-        let remote = remoteIdentity
-        let endReason: CallEndReason = (reason == .destinationClosed) ? .remoteHangup : .linkClosed
+        let remote = remoteIdentityHash
+        let endReason: CallEndReason = (reason == .remoteClosed) ? .remoteHangup : .linkClosed
         resetCallState()
         transitionState(to: .ended(endReason))
         await endedCallback?(remote, endReason)
@@ -634,15 +506,9 @@ public actor Telephone {
 
     // MARK: - Audio Pipeline Management
 
-    /// Create and start the audio pipeline for the current call.
-    ///
-    /// Creates the codec from the active profile (tries Opus/Codec2 first,
-    /// falls back to NullCodec), sets up the AudioPipeline and LinkSource,
-    /// and wires callbacks for encoding/decoding audio.
     private func startAudioPipeline() async {
         let profile = activeProfile ?? .qualityMedium
 
-        // Create codec: try real codec first, fall back to NullCodec
         let activeCodec: any AudioCodec
         switch profile.codecType {
         case .opus:
@@ -669,45 +535,36 @@ public actor Telephone {
         }
         self.codec = activeCodec
 
-        // Create pipeline
         let pipelineConfig = AudioPipeline.Config(profile: profile)
         let pipeline = AudioPipeline(config: pipelineConfig)
         self.audioPipeline = pipeline
 
-        // Create link source for receiving remote audio
         let source = LinkSource()
         self.linkSource = source
 
-        // Wire link source frame callback → pipeline decode → decoded samples callback
         let codecRef = activeCodec
-        await source.setFrameCallback { [weak pipeline] codecType, audioData in
+        await source.setFrameCallback { [weak pipeline] _, audioData in
             guard let pipeline = pipeline else { return }
             await pipeline.processReceived(audioData, codec: codecRef)
         }
 
-        // Wire pipeline encoded frame callback → pack → send over link
         await pipeline.setEncodedFrameCallback { [weak self] codecType, encodedData in
             guard let self = self else { return }
             let packed = LXSTWireFormat.packFrame(codecType: codecType, encodedAudio: encodedData)
-            if let link = await self.activeCall {
-                await self.sendData(packed, on: link)
-            }
+            await self.send(packed)
         }
 
-        // Wire pipeline decoded samples callback → forward to UI
         await pipeline.setDecodedSamplesCallback { [weak self] samples, rate, channels in
             guard let self = self else { return }
             await self.decodedAudioCallback?(samples, rate, channels)
         }
 
-        // Start components
         await pipeline.start(codec: activeCodec)
         await source.start()
 
         logger.error("[TELEPHONE] Audio pipeline started: codec=\(String(describing: activeCodec.codecType)), profile=\(profile.displayName)")
     }
 
-    /// Stop and tear down the audio pipeline.
     private func stopAudioPipeline() async {
         await audioPipeline?.stop()
         await linkSource?.stop()
@@ -723,8 +580,8 @@ public actor Telephone {
     }
 
     private func resetCallState() {
-        activeCall = nil
-        remoteIdentity = nil
+        inCall = false
+        remoteIdentityHash = nil
         isIncoming = false
         activeProfile = nil
         pendingAnswer = false
@@ -734,14 +591,14 @@ public actor Telephone {
 
     // MARK: - Caller Filtering
 
-    private func isAllowed(_ remoteId: Identity) -> Bool {
+    private func isAllowed(_ remoteHash: Data) -> Bool {
         switch allowed {
         case .allowAll:
             return true
         case .allowNone:
             return false
         case .allowList(let hashes):
-            return hashes.contains(remoteId.hash)
+            return hashes.contains(remoteHash)
         }
     }
 
@@ -775,10 +632,8 @@ public actor Telephone {
     private func handleRingTimeout() async {
         guard callState == .ringing else { return }
         logger.error("[TELEPHONE] Ring timeout")
-        let remote = remoteIdentity
-        if let link = activeCall {
-            await link.close()
-        }
+        let remote = remoteIdentityHash
+        await transport.closeCall()
         resetCallState()
         transitionState(to: .ended(.ringTimeout))
         await endedCallback?(remote, .ringTimeout)
@@ -788,10 +643,8 @@ public actor Telephone {
     private func handleConnectTimeout() async {
         guard callState == .calling || callState == .available else { return }
         logger.error("[TELEPHONE] Connect timeout")
-        let remote = remoteIdentity
-        if let link = activeCall {
-            await link.close()
-        }
+        let remote = remoteIdentityHash
+        await transport.closeCall()
         resetCallState()
         transitionState(to: .ended(.connectTimeout))
         await endedCallback?(remote, .connectTimeout)
@@ -801,7 +654,7 @@ public actor Telephone {
 
 // MARK: - Caller Filter
 
-/// Caller filtering configuration.
+/// Caller filtering configuration (by identity hash).
 public enum CallerFilter: Sendable {
     /// Allow all callers. Python Telephony.py:123
     case allowAll
@@ -809,19 +662,4 @@ public enum CallerFilter: Sendable {
     case allowNone
     /// Allow only specific identity hashes.
     case allowList([Data])
-}
-
-// MARK: - Identity Callback Handler
-
-/// Bridge between Link's IdentifyCallbacks and Telephone actor.
-final class TelephoneIdentifyHandler: IdentifyCallbacks, @unchecked Sendable {
-    private weak var telephone: Telephone?
-
-    init(telephone: Telephone) {
-        self.telephone = telephone
-    }
-
-    func remoteIdentified(_ identity: Identity) async {
-        await telephone?.handleCallerIdentified(identity)
-    }
 }
