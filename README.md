@@ -28,6 +28,7 @@ dependencies: [
 - [Reticulum](https://reticulum.network), [LXMF](https://github.com/markqvist/LXMF) and [LXST](https://github.com/markqvist/LXST) by Mark Qvist
 ## License
 
-Copyright (c) 2026 Torlando Tech LLC.
+LXST Copyright 2026 Mark Qvist. 
 
-Licensed under the [Mozilla Public License 2.0](LICENSE).
+This implementation of LXST is derived from the LXST Python implementation,
+and used under license for Columba. No derivatives or use outside Columba is permitted
